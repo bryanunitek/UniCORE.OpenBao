@@ -40,7 +40,7 @@ func CreateBackendWithStorage(t testing.TB) (*backend, logical.Storage) {
 		t.Fatal(err)
 	}
 	// Assume for our tests we have performed the migration already.
-	b.pkiStorageVersion.Store(1)
+	b.pkiStorageVersion.Store(true)
 	return b, config.StorageView
 }
 
@@ -166,7 +166,7 @@ func getParsedCrlAtPath(t *testing.T, client *api.Client, path string) *x509.Rev
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer resp.Body.Close()
+	defer resp.Body.Close() //nolint:errcheck
 
 	crlBytes, err := io.ReadAll(resp.Body)
 	if err != nil {

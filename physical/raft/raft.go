@@ -29,11 +29,11 @@ import (
 	"github.com/hashicorp/raft"
 	autopilot "github.com/hashicorp/raft-autopilot"
 	raftboltdb "github.com/hashicorp/raft-boltdb/v2"
-	snapshot "github.com/hashicorp/raft-snapshot"
 	wrapping "github.com/openbao/go-kms-wrapping/v2"
 	"github.com/openbao/openbao/api/v2"
 	"github.com/openbao/openbao/helper/metricsutil"
 	"github.com/openbao/openbao/helper/tlsdebug"
+	"github.com/openbao/openbao/physical/raft/snapshot"
 	"github.com/openbao/openbao/sdk/v2/helper/consts"
 	"github.com/openbao/openbao/sdk/v2/helper/jsonutil"
 	"github.com/openbao/openbao/sdk/v2/helper/pointerutil"
@@ -205,7 +205,9 @@ type RaftBackend struct {
 	nonVoter bool
 
 	effectiveSDKVersion string
-	failGetInTxn        *uint32
+	failGetInTxn        atomic.Bool
+
+	transactionLeakCounter atomic.Int64
 }
 
 // HookInvalidate implements physical.CacheInvalidationBackend.
@@ -557,7 +559,6 @@ func NewRaftBackend(conf map[string]string, logger log.Logger) (physical.Backend
 		autopilotUpdateInterval:    updateInterval,
 		nonVoter:                   nonVoter,
 		upgradeVersion:             upgradeVersion,
-		failGetInTxn:               new(uint32),
 	}, nil
 }
 
@@ -609,12 +610,8 @@ func (b *RaftBackend) Close() error {
 	return nil
 }
 
-func (b *RaftBackend) FailGetInTxn(fail bool) {
-	var val uint32
-	if fail {
-		val = 1
-	}
-	atomic.StoreUint32(b.failGetInTxn, val)
+func (b *RaftBackend) FailGetInTxn() {
+	b.failGetInTxn.Store(true)
 }
 
 func (b *RaftBackend) SetEffectiveSDKVersion(sdkVersion string) {

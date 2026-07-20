@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"testing"
 
 	"github.com/openbao/openbao/builtin/logical/pki"
@@ -21,11 +22,11 @@ func RunZLint(t *testing.T, certificate string) []byte {
 	certFile := filepath.Join(t.TempDir(), "cert.pem")
 	require.NoError(t, os.WriteFile(certFile, []byte(certificate), 0o600))
 
-	cmd := exec.Command("go", "run", "-modfile=tools/go.mod", "github.com/zmap/zlint/v3/cmd/zlint", certFile)
+	cmd := exec.Command("go", "tool", "-modfile=tools/go.mod", "zlint", certFile)
 	_, thisFile, _, _ := runtime.Caller(0)
 	cmd.Dir = filepath.Join(filepath.Dir(thisFile), "..", "..", "..")
 	out, err := cmd.CombinedOutput()
-	require.NoError(t, err, "zlint failed: %v:\n%s", err, string(out))
+	require.NoError(t, err, "zlint failed: %v", err)
 
 	return out
 }
@@ -59,15 +60,7 @@ func RunZLintRootTest(t *testing.T, keyType string, keyBits int, usePSS bool, ig
 		}
 
 		if result == "error" {
-			skip := false
-			for _, allowedFailures := range ignored {
-				if allowedFailures == key {
-					skip = true
-					break
-				}
-			}
-
-			if !skip {
+			if !slices.Contains(ignored, key) {
 				t.Fatalf("got unexpected error from test %v: %v", key, value)
 			}
 		}

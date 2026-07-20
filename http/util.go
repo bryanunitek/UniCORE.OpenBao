@@ -5,10 +5,14 @@ package http
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/pem"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"strings"
 
 	"github.com/hashicorp/go-multierror"
@@ -200,9 +204,7 @@ func rateLimitQuotaWrapping(handler http.Handler, core *vault.Core) http.Handler
 			quotaErr := fmt.Errorf("request path %q: %w", path, quotas.ErrRateLimitQuotaExceeded)
 			respondError(w, http.StatusTooManyRequests, quotaErr)
 
-			if core.Logger().IsTrace() {
-				core.Logger().Trace("request rejected due to rate limit quota violation", "request_path", path)
-			}
+			core.Logger().Trace("request rejected due to rate limit quota violation", "request_path", path)
 
 			if core.RateLimitAuditLoggingEnabled() {
 				req, status, err := buildLogicalRequestNoAuth(w, r)
@@ -256,4 +258,36 @@ func (m *multiReaderCloser) Close() error {
 		}
 	}
 	return err
+}
+
+// https://www.rfc-editor.org/rfc/rfc9440.html#name-encoding
+// The cert is base64 encoded with colons at the beginning and end.
+func rfc9440DecodeHeader(headerValue string) (string, error) {
+	// validate that it starts and ends with :
+	if len(headerValue) > 2 && headerValue[0] == ':' && headerValue[len(headerValue)-1] == ':' {
+		// return the value between the :
+		headerValue = headerValue[1 : len(headerValue)-1]
+	} else {
+		return "", errors.New("error decoding RFC9440 client certificate header")
+	}
+	return headerValue, nil
+}
+
+// The end result should be a base64 encoded DER certificate.
+// URL is for converting urlencoded strings back into text
+func urlDecodeHeader(headerValue string) (string, error) {
+	decoded, err := url.QueryUnescape(headerValue)
+	if err != nil {
+		return "", errors.New("error url decoding client certificate header")
+	}
+	return decoded, nil
+}
+
+func pemDecodeHeader(headerValue string) (string, error) {
+	block, _ := pem.Decode([]byte(headerValue))
+	if block == nil || block.Type != "CERTIFICATE" {
+		return "", errors.New("failed to decode PEM certificate")
+	}
+	// This is later validated in handleCertHeader in http/logical.go as part of buildLogicalRequestNoAuth
+	return base64.StdEncoding.EncodeToString(block.Bytes), nil
 }

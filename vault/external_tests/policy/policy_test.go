@@ -4,7 +4,6 @@
 package policy
 
 import (
-	"context"
 	"fmt"
 	"testing"
 	"time"
@@ -73,7 +72,7 @@ func TestPolicy_NoDefaultPolicy(t *testing.T) {
 	}
 
 	// Create a local user in LDAP
-	secret, err := client.Logical().Write("auth/ldap/users/hermes conrad", map[string]interface{}{
+	_, err = client.Logical().Write("auth/ldap/users/hermes conrad", map[string]interface{}{
 		"policies": "foo",
 	})
 	if err != nil {
@@ -81,7 +80,7 @@ func TestPolicy_NoDefaultPolicy(t *testing.T) {
 	}
 
 	// Login with LDAP and create a token
-	secret, err = client.Logical().Write("auth/ldap/login/hermes conrad", map[string]interface{}{
+	secret, err := client.Logical().Write("auth/ldap/login/hermes conrad", map[string]interface{}{
 		"password": "hermes",
 	})
 	if err != nil {
@@ -149,13 +148,13 @@ func TestPolicy_NoConfiguredPolicy(t *testing.T) {
 	}
 
 	// Create a local user in LDAP without any policies configured
-	secret, err := client.Logical().Write("auth/ldap/users/hermes conrad", map[string]interface{}{})
+	_, err = client.Logical().Write("auth/ldap/users/hermes conrad", map[string]interface{}{})
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	// Login with LDAP and create a token
-	secret, err = client.Logical().Write("auth/ldap/login/hermes conrad", map[string]interface{}{
+	secret, err := client.Logical().Write("auth/ldap/login/hermes conrad", map[string]interface{}{
 		"password": "hermes",
 	})
 	if err != nil {
@@ -273,7 +272,7 @@ func TestPolicy_TokenRenewal(t *testing.T) {
 				entityID := resp.Data["id"].(string)
 
 				// Create an alias
-				resp, err = client.Logical().Write("identity/entity-alias", map[string]interface{}{
+				_, err = client.Logical().Write("identity/entity-alias", map[string]interface{}{
 					"name":           "testuser",
 					"mount_accessor": userpassAccessor,
 					"canonical_id":   entityID,
@@ -374,22 +373,22 @@ func TestPolicy_PaginationLimit(t *testing.T) {
 	require.NoError(t, err, "failed to mount kv")
 
 	for i := 1; i <= 100; i++ {
-		_, err = client.KVv2("kv").Put(context.Background(), fmt.Sprintf("a/key-%v", i), map[string]interface{}{
+		_, err = client.KVv2("kv").Put(t.Context(), fmt.Sprintf("a/key-%v", i), map[string]interface{}{
 			"value": i,
 		})
 		require.NoError(t, err, "failed writing k/v key")
 
-		_, err = client.KVv2("kv").Put(context.Background(), fmt.Sprintf("b/key-%v", i), map[string]interface{}{
+		_, err = client.KVv2("kv").Put(t.Context(), fmt.Sprintf("b/key-%v", i), map[string]interface{}{
 			"value": i,
 		})
 		require.NoError(t, err, "failed writing k/v key")
 
-		_, err = client.KVv2("kv").Put(context.Background(), fmt.Sprintf("c/key-%v", i), map[string]interface{}{
+		_, err = client.KVv2("kv").Put(t.Context(), fmt.Sprintf("c/key-%v", i), map[string]interface{}{
 			"value": i,
 		})
 		require.NoError(t, err, "failed writing k/v key")
 
-		_, err = client.KVv2("kv").Put(context.Background(), fmt.Sprintf("d/key-%v", i), map[string]interface{}{
+		_, err = client.KVv2("kv").Put(t.Context(), fmt.Sprintf("d/key-%v", i), map[string]interface{}{
 			"value": i,
 		})
 		require.NoError(t, err, "failed writing k/v key")
@@ -449,7 +448,7 @@ path "kv/metadata/" {
 	testPagination(t, client, "", false, true)
 
 	// Test scan limits.
-	resp, err = client.Logical().Scan("kv/metadata")
+	_, err = client.Logical().Scan("kv/metadata")
 	require.Error(t, err, "expected error scanning without limits")
 
 	resp, err = client.Logical().ScanPage("kv/metadata", "", 10)

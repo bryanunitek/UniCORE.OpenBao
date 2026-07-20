@@ -7,12 +7,14 @@ import (
 	"context"
 	"fmt"
 	"path"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/go-test/deep"
+	"github.com/hashicorp/go-hclog"
 	"github.com/openbao/openbao/audit"
 	"github.com/openbao/openbao/command/server"
 	"github.com/openbao/openbao/helper/namespace"
@@ -21,7 +23,10 @@ import (
 	"github.com/openbao/openbao/sdk/v2/helper/jsonutil"
 	"github.com/openbao/openbao/sdk/v2/logical"
 	"github.com/openbao/openbao/sdk/v2/physical/inmem"
+	"github.com/openbao/openbao/vault/barrier"
+	"github.com/openbao/openbao/vault/policy"
 	"github.com/openbao/openbao/vault/quotas"
+	"github.com/openbao/openbao/vault/routing"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/protobuf/proto"
@@ -44,30 +49,38 @@ func testCore_Invalidate_TestCore(t *testing.T, config *CoreConfig) (*Core, stri
 	c.invalidations.Track()
 
 	c.stateLock.RLock()
-	c.invalidations.Start(context.Background())
+	c.invalidations.Start(t.Context())
 	c.stateLock.RUnlock()
 
 	return c, root
 }
 
-func testCore_Invalidate_sneakValueAroundCache(t *testing.T, c *Core, entry *logical.StorageEntry) {
+func testCore_Invalidate_sneakValueAroundCache(t *testing.T, ctx context.Context, c *Core, entry *logical.StorageEntry) {
 	t.Helper()
 
 	// we briefly disable the physical cache, this will put the value into the backing storage, but not update the cache
 	c.physicalCache.SetEnabled(false)
 	defer c.physicalCache.SetEnabled(true)
 
-	require.NoError(t, c.barrier.Put(t.Context(), entry))
+	ns, err := namespace.FromContext(ctx)
+	require.NoError(t, err)
+
+	view := c.NamespaceView(ns)
+	require.NoError(t, view.Put(ctx, entry))
 }
 
-func testCore_Invalidate_sneakValueAroundCacheDelete(t *testing.T, c *Core, key string) {
+func testCore_Invalidate_sneakValueAroundCacheDelete(t *testing.T, ctx context.Context, c *Core, key string) {
 	t.Helper()
 
 	// we briefly disable the physical cache, this will put the value into the backing storage, but not update the cache
 	c.physicalCache.SetEnabled(false)
 	defer c.physicalCache.SetEnabled(true)
 
-	require.NoError(t, logical.ClearView(t.Context(), logical.NewStorageView(c.barrier, key)))
+	ns, err := namespace.FromContext(ctx)
+	require.NoError(t, err)
+
+	view := c.NamespaceView(ns)
+	require.NoError(t, logical.ClearView(ctx, view.SubView(key)))
 }
 
 func testCore_Invalidate_handleRequest(t require.TestingT, ctx context.Context, c *Core, req *logical.Request, expectedErrors ...string) *logical.Response {
@@ -91,7 +104,7 @@ func testCore_Invalidate_handleRequest(t require.TestingT, ctx context.Context, 
 func TestCore_Invalidate_Namespaces(t *testing.T) {
 	t.Parallel()
 	c, root := testCore_Invalidate_TestCore(t, nil)
-
+	rootCtx := namespace.RootContext(t.Context())
 	// 1. Create some namespace to populate cache
 	ns := &namespace.Namespace{
 		ID:   "ns",
@@ -112,10 +125,10 @@ func TestCore_Invalidate_Namespaces(t *testing.T) {
 	newEntry, err := logical.StorageEntryJSON(storagePath, clone)
 	require.NoError(t, err)
 
-	testCore_Invalidate_sneakValueAroundCache(t, c, newEntry)
+	testCore_Invalidate_sneakValueAroundCache(t, rootCtx, c, newEntry)
 
 	// 2.2 add mount to namespace
-	newEntry, err = logical.StorageEntryJSON("namespaces/"+ns.UUID+"/core/mounts/666666666-6666-6666-6666-6666666666666", MountEntry{
+	newEntry, err = logical.StorageEntryJSON("namespaces/"+ns.UUID+"/core/mounts/666666666-6666-6666-6666-6666666666666", routing.MountEntry{
 		Table:       "mounts",
 		Type:        "kv",
 		Path:        "my-path",
@@ -124,17 +137,17 @@ func TestCore_Invalidate_Namespaces(t *testing.T) {
 		NamespaceID: ns.ID,
 	})
 	require.NoError(t, err)
-	testCore_Invalidate_sneakValueAroundCache(t, c, newEntry)
+	testCore_Invalidate_sneakValueAroundCache(t, rootCtx, c, newEntry)
 	mountPath := "ns/my-path"
 
 	// 3. Invalidate Path
-	c.invalidateSynchronous(storagePath)
+	require.NoError(t, c.invalidateSynchronous(storagePath))
 
 	// 4. Check cache was properly invalidated
 	// 4.1 Validate custom metadata
 	req := logical.TestRequest(t, logical.ReadOperation, "sys/namespaces/ns")
 	req.ClientToken = root
-	resp := testCore_Invalidate_handleRequest(t, namespace.RootContext(t.Context()), c, req)
+	resp := testCore_Invalidate_handleRequest(t, rootCtx, c, req)
 
 	if diff := deep.Equal(resp.Data["custom_metadata"], map[string]string{
 		"testkey": "updated value",
@@ -146,22 +159,22 @@ func TestCore_Invalidate_Namespaces(t *testing.T) {
 	require.EventuallyWithT(t, func(collect *assert.CollectT) {
 		req = logical.TestRequest(t, logical.ListOperation, mountPath)
 		req.ClientToken = root
-		resp = testCore_Invalidate_handleRequest(collect, namespace.RootContext(t.Context()), c, req)
+		resp = testCore_Invalidate_handleRequest(collect, rootCtx, c, req)
 		require.NotNil(collect, resp)
 	}, 10*time.Second, 10*time.Millisecond)
 
 	// 5. Manipulate Storage: delete namespace
-	testCore_Invalidate_sneakValueAroundCacheDelete(t, c, storagePath)
-	testCore_Invalidate_sneakValueAroundCacheDelete(t, c, "namespaces/"+ns.UUID)
+	testCore_Invalidate_sneakValueAroundCacheDelete(t, rootCtx, c, storagePath)
+	testCore_Invalidate_sneakValueAroundCacheDelete(t, rootCtx, c, "namespaces/"+ns.UUID)
 
 	// 6. Invalidate Path
-	c.invalidateSynchronous(storagePath)
+	require.NoError(t, c.invalidateSynchronous(storagePath))
 
 	// 7. Check cache was properly invalidated
 	// 7.1 namespace should be gone
 	req = logical.TestRequest(t, logical.ReadOperation, "sys/namespaces/ns")
 	req.ClientToken = root
-	resp = testCore_Invalidate_handleRequest(t, namespace.RootContext(t.Context()), c, req)
+	resp = testCore_Invalidate_handleRequest(t, rootCtx, c, req)
 
 	require.Nil(t, resp)
 
@@ -169,7 +182,7 @@ func TestCore_Invalidate_Namespaces(t *testing.T) {
 	require.EventuallyWithT(t, func(collect *assert.CollectT) {
 		req = logical.TestRequest(t, logical.ListOperation, mountPath)
 		req.ClientToken = root
-		resp = testCore_Invalidate_handleRequest(collect, namespace.RootContext(t.Context()), c, req, "unsupported path")
+		resp = testCore_Invalidate_handleRequest(collect, rootCtx, c, req, "unsupported path")
 	}, 10*time.Second, 10*time.Millisecond)
 }
 
@@ -183,6 +196,7 @@ func TestCore_Invalidate_Namespaces_NonTransactional(t *testing.T) {
 	c, root := testCore_Invalidate_TestCore(t, &CoreConfig{
 		Physical: physical,
 	})
+	rootCtx := namespace.RootContext(t.Context())
 
 	// 1. Create some namespace to populate cache
 	ns := &namespace.Namespace{
@@ -194,6 +208,7 @@ func TestCore_Invalidate_Namespaces_NonTransactional(t *testing.T) {
 	}
 
 	TestCoreCreateNamespaces(t, c, ns)
+	nsCtx := namespace.ContextWithNamespace(rootCtx, ns)
 
 	// 2. Manipulate Storage
 	// 2.1 Inject custom metadata into namespace
@@ -204,17 +219,18 @@ func TestCore_Invalidate_Namespaces_NonTransactional(t *testing.T) {
 	newEntry, err := logical.StorageEntryJSON(storagePath, clone)
 	require.NoError(t, err)
 
-	testCore_Invalidate_sneakValueAroundCache(t, c, newEntry)
+	testCore_Invalidate_sneakValueAroundCache(t, rootCtx, c, newEntry)
 
 	// 2.2 add mount to namespace
-	storageEntry, err := c.barrier.Get(t.Context(), "core/mounts")
+	view := c.NamespaceView(ns)
+	storageEntry, err := view.Get(nsCtx, coreMountConfigPath)
 	require.NoError(t, err)
 	require.NotNil(t, storageEntry, "expected mount table to be written at %s", storagePath)
 
-	mountTable := new(MountTable)
+	mountTable := new(routing.MountTable)
 	require.NoError(t, jsonutil.DecodeJSON(storageEntry.Value, mountTable))
 
-	mountTable.Entries = append(mountTable.Entries, &MountEntry{
+	mountTable.Entries = append(mountTable.Entries, &routing.MountEntry{
 		Table:       "mounts",
 		Type:        "kv",
 		Path:        "my-path",
@@ -227,19 +243,19 @@ func TestCore_Invalidate_Namespaces_NonTransactional(t *testing.T) {
 	updatedData, err := jsonutil.EncodeJSON(mountTable)
 	require.NoError(t, err)
 
-	testCore_Invalidate_sneakValueAroundCache(t, c, &logical.StorageEntry{
-		Key:   "core/mounts",
+	testCore_Invalidate_sneakValueAroundCache(t, nsCtx, c, &logical.StorageEntry{
+		Key:   coreMountConfigPath,
 		Value: updatedData,
 	})
 
 	// 3. Invalidate Path
-	c.invalidateSynchronous(storagePath)
+	require.NoError(t, c.invalidateSynchronous(storagePath))
 
 	// 4. Check cache was properly invalidated
 	// 4.1 Validate custom metadata
 	req := logical.TestRequest(t, logical.ReadOperation, "sys/namespaces/ns")
 	req.ClientToken = root
-	resp := testCore_Invalidate_handleRequest(t, namespace.RootContext(t.Context()), c, req)
+	resp := testCore_Invalidate_handleRequest(t, rootCtx, c, req)
 
 	if diff := deep.Equal(resp.Data["custom_metadata"], map[string]string{
 		"testkey": "updated value",
@@ -251,36 +267,47 @@ func TestCore_Invalidate_Namespaces_NonTransactional(t *testing.T) {
 	require.EventuallyWithT(t, func(collect *assert.CollectT) {
 		req = logical.TestRequest(t, logical.ListOperation, mountPath)
 		req.ClientToken = root
-		resp = testCore_Invalidate_handleRequest(collect, namespace.RootContext(t.Context()), c, req)
+		resp = testCore_Invalidate_handleRequest(collect, rootCtx, c, req)
 		require.NotNil(collect, resp)
 	}, 10*time.Second, 10*time.Millisecond)
 }
 
 func TestCore_Invalidate_Policy(t *testing.T) {
 	t.Parallel()
-	testCases := map[string]func(t *testing.T, c *Core) (storagePath string, ctx context.Context){
-		"global": func(t *testing.T, c *Core) (storagePath string, ctx context.Context) {
-			return "sys/policy/test-policy", namespace.RootContext(t.Context())
+	testCases := map[string]func(t *testing.T, c *Core) context.Context{
+		"global": func(t *testing.T, c *Core) context.Context {
+			return namespace.RootContext(t.Context())
 		},
 
-		"local": func(t *testing.T, c *Core) (storagePath string, ctx context.Context) {
+		"local": func(t *testing.T, c *Core) context.Context {
 			ns := &namespace.Namespace{
 				ID:   "ns",
 				Path: "ns",
 			}
 			TestCoreCreateNamespaces(t, c, ns)
 
-			return fmt.Sprintf("namespaces/%s/sys/policy/test-policy", ns.UUID), namespace.ContextWithNamespace(t.Context(), ns)
+			return namespace.ContextWithNamespace(t.Context(), ns)
+		},
+
+		"unsealed": func(t *testing.T, c *Core) context.Context {
+			ns := &namespace.Namespace{
+				ID:   "unsealed",
+				Path: "unsealed",
+			}
+			TestCoreCreateUnsealedNamespaces(t, c, ns)
+
+			return namespace.ContextWithNamespace(t.Context(), ns)
 		},
 	}
 
 	for name, init := range testCases {
 		t.Run(name, func(t *testing.T) {
 			c, root := testCore_Invalidate_TestCore(t, nil)
-			storagePath, ctx := init(t, c)
+			ctx := init(t, c)
 
 			// 1. Create some policy to populate cache
-			req := logical.TestRequest(t, logical.CreateOperation, "sys/policy/test-policy")
+			storagePath := "sys/policy/test-policy"
+			req := logical.TestRequest(t, logical.CreateOperation, storagePath)
 			req.ClientToken = root
 			req.Data = map[string]interface{}{
 				"policy": `
@@ -292,22 +319,29 @@ func TestCore_Invalidate_Policy(t *testing.T) {
 			testCore_Invalidate_handleRequest(t, ctx, c, req)
 
 			// 2. Manipulate Storage
-			policy, err := c.policyStore.GetPolicy(ctx, "test-policy", PolicyTypeACL)
+			pol, err := c.policyStore.GetPolicy(ctx, "test-policy", policy.TypeACL)
 			require.NoError(t, err)
 
-			clone := policy.ShallowClone()
+			clone := pol.ShallowClone()
 			clone.Expiration = time.Date(2099, 1, 1, 12, 0, 0, 0, time.UTC)
 
 			newEntry, err := logical.StorageEntryJSON(storagePath, clone)
 			require.NoError(t, err)
 
-			testCore_Invalidate_sneakValueAroundCache(t, c, newEntry)
+			testCore_Invalidate_sneakValueAroundCache(t, ctx, c, newEntry)
+
+			ns, err := namespace.FromContext(ctx)
+			require.NoError(t, err)
+
+			if ns.ID != namespace.RootNamespaceID {
+				storagePath = path.Join(barrier.NamespacePrefix, ns.UUID, storagePath)
+			}
 
 			// 3. Invalidate Path
-			c.invalidateSynchronous(storagePath)
+			require.NoError(t, c.invalidateSynchronous(storagePath))
 
 			// 4. Check cache was properly invalidated
-			updatedPolicy, err := c.policyStore.GetPolicy(ctx, "test-policy", PolicyTypeACL)
+			updatedPolicy, err := c.policyStore.GetPolicy(ctx, "test-policy", policy.TypeACL)
 			require.NoError(t, err)
 
 			require.Equal(t, clone.Expiration, updatedPolicy.Expiration)
@@ -318,17 +352,18 @@ func TestCore_Invalidate_Policy(t *testing.T) {
 func TestCore_Invalidate_Quota(t *testing.T) {
 	t.Parallel()
 	c, root := testCore_Invalidate_TestCore(t, nil)
+	rootCtx := namespace.RootContext(t.Context())
 
-	// 1. Create some qutoa to populate cache
+	// 1. Create quota to populate cache
 	req := logical.TestRequest(t, logical.CreateOperation, "sys/quotas/rate-limit/test-quota")
 	req.ClientToken = root
 	req.Data = map[string]any{
 		"rate":     3.141,
 		"interval": "42s",
 	}
-	testCore_Invalidate_handleRequest(t, t.Context(), c, req)
+	testCore_Invalidate_handleRequest(t, rootCtx, c, req)
 
-	// 2. Manipulate Storage
+	// 2. Manipulate storage: write updated quota
 	quota, err := c.quotaManager.QuotaByName("rate-limit", "test-quota")
 	require.NoError(t, err)
 
@@ -338,68 +373,193 @@ func TestCore_Invalidate_Quota(t *testing.T) {
 	newEntry, err := logical.StorageEntryJSON("sys/quotas/rate-limit/test-quota", clone)
 	require.NoError(t, err)
 
-	testCore_Invalidate_sneakValueAroundCache(t, c, newEntry)
+	testCore_Invalidate_sneakValueAroundCache(t, rootCtx, c, newEntry)
 
 	// 3. Invalidate Path
-	c.invalidateSynchronous("sys/quotas/rate-limit/test-quota")
+	require.NoError(t, c.invalidateSynchronous(newEntry.Key))
 
-	// 4. Check cache was properly invalidated
-	req = logical.TestRequest(t, logical.ReadOperation, "sys/quotas/rate-limit/test-quota")
+	// 4. Check cache: quota updated
+	req = logical.TestRequest(t, logical.ReadOperation, newEntry.Key)
 	req.ClientToken = root
 
-	resp := testCore_Invalidate_handleRequest(t, t.Context(), c, req)
-
+	resp := testCore_Invalidate_handleRequest(t, rootCtx, c, req)
 	require.Equal(t, 1, resp.Data["interval"])
+
+	// 5. Delete quota
+	testCore_Invalidate_sneakValueAroundCacheDelete(t, rootCtx, c, newEntry.Key)
+
+	// 6. Invalidate Path
+	require.NoError(t, c.invalidateSynchronous(newEntry.Key))
+
+	// 7. Check cache: quota deleted
+	req = logical.TestRequest(t, logical.ReadOperation, newEntry.Key)
+	req.ClientToken = root
+	resp = testCore_Invalidate_handleRequest(t, rootCtx, c, req)
+
+	require.Nil(t, resp)
+
+	// 8. Manipulate quota in storage: restore quota
+	testCore_Invalidate_sneakValueAroundCache(t, rootCtx, c, newEntry)
+
+	// 9. Invalidate path
+	require.NoError(t, c.invalidateSynchronous(newEntry.Key))
+
+	// 10. Check cache: quota brought back
+	resp = testCore_Invalidate_handleRequest(t, rootCtx, c, req)
+	require.NotNil(t, resp.Data)
+	require.Equal(t, 1, resp.Data["interval"])
+}
+
+func TestCore_Upgrade_Keyring(t *testing.T) {
+	t.Parallel()
+	testCases := map[string]func(t *testing.T, c *Core) context.Context{
+		"global": func(t *testing.T, c *Core) context.Context {
+			return namespace.RootContext(t.Context())
+		},
+
+		"unsealed": func(t *testing.T, c *Core) context.Context {
+			ns := &namespace.Namespace{
+				ID:   "unsealed",
+				Path: "unsealed",
+			}
+			TestCoreCreateUnsealedNamespaces(t, c, ns)
+
+			return namespace.ContextWithNamespace(t.Context(), ns)
+		},
+	}
+
+	for name, init := range testCases {
+		t.Run(name, func(t *testing.T) {
+			c, root := testCore_Invalidate_TestCore(t, nil)
+			ctx := init(t, c)
+
+			ns, err := namespace.FromContext(ctx)
+			require.NoError(t, err)
+
+			// 1. Retrieve key status information.
+			req := logical.TestRequest(t, logical.ReadOperation, "sys/key-status")
+			req.ClientToken = root
+			resp := testCore_Invalidate_handleRequest(t, ctx, c, req)
+			require.NotNil(t, resp)
+			prevTerm := resp.Data["term"].(int)
+			require.Equal(t, 1, prevTerm)
+
+			// 2. Manipulate Storage.
+			b := c.sealManager.NamespaceBarrier(ns.Path)
+			require.NoError(t, err)
+
+			path := fmt.Sprintf("core/upgrade/%d", prevTerm)
+			keyring, err := b.Keyring()
+			require.NoError(t, err)
+
+			buf, err := keyring.TermKey(uint32(prevTerm)).Serialize()
+			require.NoError(t, err)
+			value, err := b.Encrypt(ctx, path, buf)
+			require.NoError(t, err)
+
+			newTerm, err := b.Rotate(ctx)
+			require.NoError(t, err)
+			require.Equal(t, uint32(prevTerm+1), newTerm)
+
+			testCore_Invalidate_sneakValueAroundCache(t, ctx, c, &logical.StorageEntry{
+				Key:   strings.TrimPrefix(path, c.NamespaceView(ns).Prefix()),
+				Value: value,
+			})
+
+			// 3. Invalidate path.
+			require.NoError(t, c.invalidateSynchronous(path))
+
+			// 4. Check cache was properly invalidated.
+			req = logical.TestRequest(t, logical.ReadOperation, "sys/key-status")
+			req.ClientToken = root
+			resp = testCore_Invalidate_handleRequest(t, ctx, c, req)
+			require.Equal(t, prevTerm+1, resp.Data["term"].(int))
+		})
+	}
 }
 
 func TestCore_Invalidate_LoginMFA(t *testing.T) {
 	t.Parallel()
-	c, root := testCore_Invalidate_TestCore(t, nil)
-	rootCtx := namespace.RootContext(t.Context())
+	testCases := map[string]func(t *testing.T, c *Core) context.Context{
+		"global": func(t *testing.T, c *Core) context.Context {
+			return namespace.RootContext(t.Context())
+		},
 
-	// 1. Create a login MFA to populate the cache.
-	req := logical.TestRequest(t, logical.CreateOperation, "identity/mfa/method/totp")
-	req.ClientToken = root
-	req.Data = map[string]any{
-		"method_name": "testing",
-		"issuer":      "OpenBao",
+		"local": func(t *testing.T, c *Core) context.Context {
+			ns := &namespace.Namespace{
+				ID:   "ns",
+				Path: "ns",
+			}
+			TestCoreCreateNamespaces(t, c, ns)
+
+			return namespace.ContextWithNamespace(t.Context(), ns)
+		},
+
+		"unsealed": func(t *testing.T, c *Core) context.Context {
+			ns := &namespace.Namespace{
+				ID:   "unsealed",
+				Path: "unsealed",
+			}
+			TestCoreCreateUnsealedNamespaces(t, c, ns)
+
+			return namespace.ContextWithNamespace(t.Context(), ns)
+		},
 	}
-	resp := testCore_Invalidate_handleRequest(t, rootCtx, c, req)
-	require.NotNil(t, resp)
-	require.Contains(t, resp.Data, "method_id")
-	path := resp.Data["method_id"].(string)
 
-	// 2. Manipulate Storage
-	barrierView := NamespaceView(c.barrier, namespace.RootNamespace).SubView(systemBarrierPrefix).SubView(loginMFAConfigPrefix)
-	mfa, err := c.loginMFABackend.getMFAConfig(rootCtx, path, barrierView)
-	require.NoError(t, err)
-	require.NotNil(t, mfa)
-	require.Equal(t, mfa.Name, "testing")
+	for name, init := range testCases {
+		t.Run(name, func(t *testing.T) {
+			c, root := testCore_Invalidate_TestCore(t, nil)
+			ctx := init(t, c)
 
-	clone, err := mfa.Clone()
-	require.NoError(t, err)
+			ns, err := namespace.FromContext(ctx)
+			require.NoError(t, err)
 
-	clone.Name = "my-custom-name"
+			// 1. Create a login MFA to populate the cache.
+			req := logical.TestRequest(t, logical.CreateOperation, "identity/mfa/method/totp")
+			req.ClientToken = root
+			req.Data = map[string]any{
+				"method_name": "testing",
+				"issuer":      "OpenBao",
+			}
+			resp := testCore_Invalidate_handleRequest(t, ctx, c, req)
+			require.NotNil(t, resp)
+			require.Contains(t, resp.Data, "method_id")
+			path := resp.Data["method_id"].(string)
 
-	fullPath := systemBarrierPrefix + loginMFAConfigPrefix + path
-	newEntry, err := proto.Marshal(clone)
-	require.NoError(t, err)
+			// 2. Manipulate Storage
+			barrierView := c.NamespaceView(ns).SubView(barrier.SystemBarrierPrefix + loginMFAConfigPrefix)
+			mfa, err := c.loginMFABackend.getMFAConfig(ctx, path, barrierView)
+			require.NoError(t, err)
+			require.NotNil(t, mfa)
+			require.Equal(t, mfa.Name, "testing")
 
-	testCore_Invalidate_sneakValueAroundCache(t, c, &logical.StorageEntry{
-		Key:   fullPath,
-		Value: newEntry,
-	})
+			clone, err := mfa.Clone()
+			require.NoError(t, err)
 
-	// 3. Invalidate path
-	c.invalidateSynchronous(fullPath)
+			clone.Name = "my-custom-name"
 
-	// 4. Check cache was properly invalidated
-	req = logical.TestRequest(t, logical.ReadOperation, "identity/mfa/method/totp/"+path)
-	req.ClientToken = root
+			fullPath := barrierView.Prefix() + path
+			newEntry, err := proto.Marshal(clone)
+			require.NoError(t, err)
 
-	resp = testCore_Invalidate_handleRequest(t, rootCtx, c, req)
-	require.Contains(t, resp.Data, "name")
-	require.Equal(t, "my-custom-name", resp.Data["name"])
+			writePath := strings.TrimPrefix(fullPath, c.NamespaceView(ns).Prefix())
+			testCore_Invalidate_sneakValueAroundCache(t, ctx, c, &logical.StorageEntry{
+				Key:   writePath,
+				Value: newEntry,
+			})
+
+			// 3. Invalidate path
+			require.NoError(t, c.invalidateSynchronous(fullPath))
+
+			// 4. Check cache was properly invalidated
+			req = logical.TestRequest(t, logical.ReadOperation, "identity/mfa/method/totp/"+path)
+			req.ClientToken = root
+
+			resp = testCore_Invalidate_handleRequest(t, ctx, c, req)
+			require.Contains(t, resp.Data, "name")
+			require.Equal(t, "my-custom-name", resp.Data["name"])
+		})
+	}
 }
 
 func TestCore_Invalidate_Plugin(t *testing.T) {
@@ -413,6 +573,16 @@ func TestCore_Invalidate_Plugin(t *testing.T) {
 			ns := &namespace.Namespace{
 				ID:   "ns",
 				Path: "ns",
+			}
+			TestCoreCreateNamespaces(t, c, ns)
+
+			return fmt.Sprintf("namespaces/%s/", ns.UUID), namespace.ContextWithNamespace(t.Context(), ns)
+		},
+
+		"unsealed": func(t *testing.T, c *Core) (nsPrefix string, ctx context.Context) {
+			ns := &namespace.Namespace{
+				ID:   "unsealed",
+				Path: "unsealed",
 			}
 			TestCoreCreateNamespaces(t, c, ns)
 
@@ -462,8 +632,8 @@ func TestCore_Invalidate_Plugin(t *testing.T) {
 			uuid := resp.Data["uuid"].(string)
 
 			// 4. Invalidate Paths
-			c.invalidateSynchronous(nsPrefix + "logical/" + uuid + "/foo")
-			c.invalidateSynchronous(nsPrefix + "logical/" + uuid + "/bar/bazz")
+			require.NoError(t, c.invalidateSynchronous(nsPrefix+"logical/"+uuid+"/foo"))
+			require.NoError(t, c.invalidateSynchronous(nsPrefix+"logical/"+uuid+"/bar/bazz"))
 
 			// 5. Check callback was called
 			assert.Equal(t, []string{"foo", "bar/bazz"}, invalidatedKey)
@@ -476,6 +646,7 @@ func TestCore_Invalidate_Audit(t *testing.T) {
 	c, root := testCore_Invalidate_TestCore(t, &CoreConfig{
 		RawConfig: &server.Config{UnsafeAllowAPIAuditCreation: true, AllowAuditLogPrefixing: true},
 	})
+	rootCtx := namespace.RootContext(t.Context())
 
 	// 1. Inject a dummy audit factory
 	var callCount atomic.Int32
@@ -501,13 +672,13 @@ func TestCore_Invalidate_Audit(t *testing.T) {
 		},
 	}
 
-	testCore_Invalidate_handleRequest(t, t.Context(), c, registerReq)
+	testCore_Invalidate_handleRequest(t, rootCtx, c, registerReq)
 
 	require.EqualValues(t, 1, callCount.Load(), "expected audit factory to be called exactly once")
 
 	// 3. Trigger audit event
 	triggerAuditEvent := func() {
-		testCore_Invalidate_handleRequest(t, t.Context(), c, &logical.Request{
+		testCore_Invalidate_handleRequest(t, rootCtx, c, &logical.Request{
 			Operation:   logical.ReadOperation,
 			ClientToken: root,
 			Path:        "secret/kv/dummy",
@@ -518,25 +689,25 @@ func TestCore_Invalidate_Audit(t *testing.T) {
 	require.Len(t, currentBackend.Req, 1, "expected 1 audit request event")
 
 	// 4. Manipulate audit table in storage: delete audit
-	entry, err := c.barrier.Get(t.Context(), "core/audit")
+	entry, err := c.barrier.Get(rootCtx, "core/audit")
 	require.NoError(t, err)
 	require.NotNil(t, entry, "expected audit table to be written")
 
-	auditTable := &MountTable{}
+	auditTable := &routing.MountTable{}
 	require.NoError(t, jsonutil.DecodeJSON(entry.Value, auditTable), "failed to decode audit table")
 
-	auditTable.Entries = make([]*MountEntry, 0)
+	auditTable.Entries = make([]*routing.MountEntry, 0)
 
 	data, err := jsonutil.EncodeJSON(auditTable)
 	require.NoError(t, err)
 
-	testCore_Invalidate_sneakValueAroundCache(t, c, &logical.StorageEntry{
+	testCore_Invalidate_sneakValueAroundCache(t, rootCtx, c, &logical.StorageEntry{
 		Key:   "core/audit",
 		Value: data,
 	})
 
 	// 5. call invalidate
-	c.invalidateSynchronous("core/audit")
+	require.NoError(t, c.invalidateSynchronous("core/audit"))
 
 	require.EventuallyWithT(t, func(collect *assert.CollectT) {
 		require.Equal(collect, 0, c.auditBroker.Count())
@@ -550,10 +721,10 @@ func TestCore_Invalidate_Audit(t *testing.T) {
 	require.Len(t, currentBackend.Req, 1, "expected still 1 audit request event")
 
 	// 7. Manipulate audit table in storage: restore audit
-	testCore_Invalidate_sneakValueAroundCache(t, c, entry)
+	testCore_Invalidate_sneakValueAroundCache(t, rootCtx, c, entry)
 
 	// 8. call invalidate
-	c.invalidateSynchronous("core/audit")
+	require.NoError(t, c.invalidateSynchronous("core/audit"))
 
 	require.EventuallyWithT(t, func(collect *assert.CollectT) {
 		require.EqualValues(collect, 2, callCount.Load(), "expected audit factory to be called exactly twice")
@@ -570,19 +741,29 @@ func TestCore_Invalidate_Audit(t *testing.T) {
 
 func TestCore_Invalidate_SecretMount(t *testing.T) {
 	t.Parallel()
-	testCases := map[string]func(t *testing.T, c *Core) (nsPrefix string, ctx context.Context){
-		"global": func(t *testing.T, c *Core) (nsPrefix string, ctx context.Context) {
-			return "", namespace.RootContext(t.Context())
+	testCases := map[string]func(t *testing.T, c *Core) context.Context{
+		"global": func(t *testing.T, c *Core) context.Context {
+			return namespace.RootContext(t.Context())
 		},
 
-		"local": func(t *testing.T, c *Core) (nsPrefix string, ctx context.Context) {
+		"local": func(t *testing.T, c *Core) context.Context {
 			ns := &namespace.Namespace{
 				ID:   "ns",
 				Path: "ns",
 			}
 			TestCoreCreateNamespaces(t, c, ns)
 
-			return fmt.Sprintf("namespaces/%s/", ns.UUID), namespace.ContextWithNamespace(t.Context(), ns)
+			return namespace.ContextWithNamespace(t.Context(), ns)
+		},
+
+		"unsealed": func(t *testing.T, c *Core) context.Context {
+			ns := &namespace.Namespace{
+				ID:   "ns",
+				Path: "ns",
+			}
+			TestCoreCreateUnsealedNamespaces(t, c, ns)
+
+			return namespace.ContextWithNamespace(t.Context(), ns)
 		},
 	}
 
@@ -590,7 +771,7 @@ func TestCore_Invalidate_SecretMount(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 			c, root := testCore_Invalidate_TestCore(t, nil)
-			nsPrefix, ctx := init(t, c)
+			ctx := init(t, c)
 
 			// 1. Inject a dummy factory
 			var factoryCallCount, cleanCallCount, readCallCount atomic.Int32
@@ -630,16 +811,15 @@ func TestCore_Invalidate_SecretMount(t *testing.T) {
 			require.EqualValues(t, 1, factoryCallCount.Load(), "expected factory to be called exactly once")
 			require.Equal(t, mountTableCount+1, len(c.mounts.Entries), "expected mount table to grew by one")
 
-			// 3. Get the UUID
+			// 3. Get mount UUID
 			readReq := &logical.Request{
 				Operation:   logical.ReadOperation,
 				ClientToken: root,
 				Path:        "sys/mounts/my-kv-mount",
 			}
 			resp := testCore_Invalidate_handleRequest(t, ctx, c, readReq)
-
 			uuid := resp.Data["uuid"].(string)
-			storagePath := path.Join(nsPrefix, "core/mounts", uuid)
+			entryPath := path.Join(coreMountConfigPath, uuid)
 
 			triggerReadCall := func(collect require.TestingT, expectedErrors ...string) {
 				testCore_Invalidate_handleRequest(collect, ctx, c, &logical.Request{
@@ -651,15 +831,19 @@ func TestCore_Invalidate_SecretMount(t *testing.T) {
 			triggerReadCall(t)
 			require.EqualValues(t, 1, readCallCount.Load(), "expected one read call")
 
-			// 4. Manipulate mount table in storage: delete storageEntry
-			storageEntry, err := c.barrier.Get(ctx, storagePath)
+			ns, err := namespace.FromContext(ctx)
 			require.NoError(t, err)
-			require.NotNil(t, storageEntry, "expected mount entry to be written at %s", storagePath)
+			view := c.NamespaceView(ns)
 
-			testCore_Invalidate_sneakValueAroundCacheDelete(t, c, storagePath)
+			// 4. Manipulate mount table in storage: delete storageEntry
+			storageEntry, err := view.Get(ctx, entryPath)
+			require.NoError(t, err)
+			require.NotNil(t, storageEntry, "expected mount entry to be written at %s", view.Prefix()+entryPath)
+
+			testCore_Invalidate_sneakValueAroundCacheDelete(t, ctx, c, entryPath)
 
 			// 5. call invalidate
-			c.invalidateSynchronous(storagePath)
+			require.NoError(t, c.invalidateSynchronous(view.Prefix()+entryPath))
 
 			require.EventuallyWithT(t, func(collect *assert.CollectT) {
 				c.mountsLock.RLock()
@@ -674,10 +858,10 @@ func TestCore_Invalidate_SecretMount(t *testing.T) {
 			triggerReadCall(t, "unsupported path")
 
 			// 7. Manipulate mount table in storage: restore mount
-			testCore_Invalidate_sneakValueAroundCache(t, c, storageEntry)
+			testCore_Invalidate_sneakValueAroundCache(t, ctx, c, storageEntry)
 
 			// 8. call invalidate
-			c.invalidateSynchronous(storagePath)
+			require.NoError(t, c.invalidateSynchronous(view.Prefix()+entryPath))
 
 			require.EventuallyWithT(t, func(collect *assert.CollectT) {
 				c.mountsLock.RLock()
@@ -689,20 +873,20 @@ func TestCore_Invalidate_SecretMount(t *testing.T) {
 			require.EqualValues(t, 2, readCallCount.Load(), "expected two read calls")
 
 			// 9. Manipulate mount table in storage: taint mount
-			mountEntry := new(MountEntry)
+			mountEntry := new(routing.MountEntry)
 			require.NoError(t, jsonutil.DecodeJSON(storageEntry.Value, mountEntry))
 			mountEntry.Tainted = true
 
 			updatedData, err := jsonutil.EncodeJSON(mountEntry)
 			require.NoError(t, err)
 
-			testCore_Invalidate_sneakValueAroundCache(t, c, &logical.StorageEntry{
-				Key:   storagePath,
+			testCore_Invalidate_sneakValueAroundCache(t, ctx, c, &logical.StorageEntry{
+				Key:   entryPath,
 				Value: updatedData,
 			})
 
 			// 10. call invalidate
-			c.invalidateSynchronous(storagePath)
+			require.NoError(t, c.invalidateSynchronous(view.Prefix()+entryPath))
 
 			require.EventuallyWithT(t, func(collect *assert.CollectT) {
 				triggerReadCall(collect, "unsupported path")
@@ -715,13 +899,13 @@ func TestCore_Invalidate_SecretMount(t *testing.T) {
 			updatedData, err = jsonutil.EncodeJSON(mountEntry)
 			require.NoError(t, err)
 
-			testCore_Invalidate_sneakValueAroundCache(t, c, &logical.StorageEntry{
-				Key:   storagePath,
+			testCore_Invalidate_sneakValueAroundCache(t, ctx, c, &logical.StorageEntry{
+				Key:   entryPath,
 				Value: updatedData,
 			})
 
 			// 12. call invalidate
-			c.invalidateSynchronous(storagePath)
+			require.NoError(t, c.invalidateSynchronous(view.Prefix()+entryPath))
 
 			require.EventuallyWithT(t, func(collect *assert.CollectT) {
 				resp := testCore_Invalidate_handleRequest(collect, ctx, c, &logical.Request{
@@ -740,13 +924,13 @@ func TestCore_Invalidate_SecretMount(t *testing.T) {
 			updatedData, err = jsonutil.EncodeJSON(mountEntry)
 			require.NoError(t, err)
 
-			testCore_Invalidate_sneakValueAroundCache(t, c, &logical.StorageEntry{
-				Key:   storagePath,
+			testCore_Invalidate_sneakValueAroundCache(t, ctx, c, &logical.StorageEntry{
+				Key:   entryPath,
 				Value: updatedData,
 			})
 
 			// 14. call invalidate
-			c.invalidateSynchronous(storagePath)
+			require.NoError(t, c.invalidateSynchronous(view.Prefix()+entryPath))
 
 			require.EventuallyWithT(t, func(collect *assert.CollectT) {
 				require.EqualValues(collect, 3, factoryCallCount.Load(), "expected factory to be called exactly thrice")
@@ -772,6 +956,16 @@ func TestCore_Invalidate_SecretMount_NonTransactional(t *testing.T) {
 
 			return namespace.ContextWithNamespace(t.Context(), ns)
 		},
+
+		"unsealed": func(t *testing.T, c *Core) context.Context {
+			ns := &namespace.Namespace{
+				ID:   "unsealed",
+				Path: "unsealed",
+			}
+			TestCoreCreateUnsealedNamespaces(t, c, ns)
+
+			return namespace.ContextWithNamespace(t.Context(), ns)
+		},
 	}
 
 	for name, init := range testCases {
@@ -826,8 +1020,6 @@ func TestCore_Invalidate_SecretMount_NonTransactional(t *testing.T) {
 			require.EqualValues(t, 1, factoryCallCount.Load(), "expected factory to be called exactly once")
 			require.Equal(t, mountTableCount+1, len(c.mounts.Entries), "expected mount table to grew by one")
 
-			storagePath := "core/mounts"
-
 			triggerReadCall := func(collect require.TestingT, expectedErrors ...string) {
 				testCore_Invalidate_handleRequest(collect, ctx, c, &logical.Request{
 					Operation:   logical.ReadOperation,
@@ -838,12 +1030,16 @@ func TestCore_Invalidate_SecretMount_NonTransactional(t *testing.T) {
 			triggerReadCall(t)
 			require.EqualValues(t, 1, readCallCount.Load(), "expected one read call")
 
-			// 3. Manipulate mount table in storage: delete entry from mount table
-			storageEntry, err := c.barrier.Get(ctx, storagePath)
+			ns, err := namespace.FromContext(ctx)
 			require.NoError(t, err)
-			require.NotNil(t, storageEntry, "expected mount table to be written at %s", storagePath)
+			view := c.NamespaceView(ns)
 
-			mountTable := new(MountTable)
+			// 3. Manipulate mount table in storage: delete entry from mount table
+			storageEntry, err := view.Get(ctx, coreMountConfigPath)
+			require.NoError(t, err)
+			require.NotNil(t, storageEntry, "expected mount table to be written at %s", view.Prefix()+coreMountConfigPath)
+
+			mountTable := new(routing.MountTable)
 			require.NoError(t, jsonutil.DecodeJSON(storageEntry.Value, mountTable))
 
 			require.Equal(t, "my-kv-mount/", mountTable.Entries[len(mountTable.Entries)-1].Path)
@@ -852,13 +1048,13 @@ func TestCore_Invalidate_SecretMount_NonTransactional(t *testing.T) {
 			updatedData, err := jsonutil.EncodeJSON(mountTable)
 			require.NoError(t, err)
 
-			testCore_Invalidate_sneakValueAroundCache(t, c, &logical.StorageEntry{
-				Key:   storagePath,
+			testCore_Invalidate_sneakValueAroundCache(t, ctx, c, &logical.StorageEntry{
+				Key:   coreMountConfigPath,
 				Value: updatedData,
 			})
 
 			// 4. call invalidate
-			c.invalidateSynchronous(storagePath)
+			require.NoError(t, c.invalidateSynchronous(view.Prefix()+coreMountConfigPath))
 
 			require.EventuallyWithT(t, func(collect *assert.CollectT) {
 				c.mountsLock.RLock()
@@ -873,10 +1069,10 @@ func TestCore_Invalidate_SecretMount_NonTransactional(t *testing.T) {
 			triggerReadCall(t, "unsupported path")
 
 			// 6. Manipulate mount table in storage: restore mount
-			testCore_Invalidate_sneakValueAroundCache(t, c, storageEntry)
+			testCore_Invalidate_sneakValueAroundCache(t, ctx, c, storageEntry)
 
 			// 7. call invalidate
-			c.invalidateSynchronous(storagePath)
+			require.NoError(t, c.invalidateSynchronous(view.Prefix()+coreMountConfigPath))
 
 			require.EventuallyWithT(t, func(collect *assert.CollectT) {
 				c.mountsLock.RLock()
@@ -892,19 +1088,29 @@ func TestCore_Invalidate_SecretMount_NonTransactional(t *testing.T) {
 
 func TestCore_Invalidate_AuthMount(t *testing.T) {
 	t.Parallel()
-	testCases := map[string]func(t *testing.T, c *Core) (nsPrefix string, ctx context.Context){
-		"global": func(t *testing.T, c *Core) (nsPrefix string, ctx context.Context) {
-			return "", namespace.RootContext(t.Context())
+	testCases := map[string]func(t *testing.T, c *Core) context.Context{
+		"global": func(t *testing.T, c *Core) context.Context {
+			return namespace.RootContext(t.Context())
 		},
 
-		"local": func(t *testing.T, c *Core) (nsPrefix string, ctx context.Context) {
+		"local": func(t *testing.T, c *Core) context.Context {
 			ns := &namespace.Namespace{
 				ID:   "ns",
 				Path: "ns",
 			}
 			TestCoreCreateNamespaces(t, c, ns)
 
-			return fmt.Sprintf("namespaces/%s/", ns.UUID), namespace.ContextWithNamespace(t.Context(), ns)
+			return namespace.ContextWithNamespace(t.Context(), ns)
+		},
+
+		"unsealed": func(t *testing.T, c *Core) context.Context {
+			ns := &namespace.Namespace{
+				ID:   "unsealed",
+				Path: "unsealed",
+			}
+			TestCoreCreateUnsealedNamespaces(t, c, ns)
+
+			return namespace.ContextWithNamespace(t.Context(), ns)
 		},
 	}
 
@@ -912,7 +1118,7 @@ func TestCore_Invalidate_AuthMount(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 			c, root := testCore_Invalidate_TestCore(t, nil)
-			nsPrefix, ctx := init(t, c)
+			ctx := init(t, c)
 
 			// 1. Inject a dummy factory
 			var factoryCallCount, cleanCallCount, readCallCount atomic.Int32
@@ -952,16 +1158,15 @@ func TestCore_Invalidate_AuthMount(t *testing.T) {
 			require.EqualValues(t, 1, factoryCallCount.Load(), "expected factory to be called exactly once")
 			require.Equal(t, mountTableCount+1, len(c.auth.Entries), "expected mount table to grew by one")
 
-			// 3. Get the UUID
+			// 3. Get mount UUID
 			readReq := &logical.Request{
 				Operation:   logical.ReadOperation,
 				ClientToken: root,
 				Path:        "sys/auth/my-auth",
 			}
 			resp := testCore_Invalidate_handleRequest(t, ctx, c, readReq)
-
 			uuid := resp.Data["uuid"].(string)
-			storagePath := path.Join(nsPrefix, "core/auth", uuid)
+			entryPath := path.Join(coreAuthConfigPath, uuid)
 
 			callLogin := func(collect require.TestingT, expectedErrors ...string) {
 				testCore_Invalidate_handleRequest(collect, ctx, c, &logical.Request{
@@ -973,15 +1178,19 @@ func TestCore_Invalidate_AuthMount(t *testing.T) {
 			callLogin(t)
 			require.EqualValues(t, 1, readCallCount.Load(), "expected one read call")
 
-			// 4. Manipulate mount table in storage: delete storageEntry
-			storageEntry, err := c.barrier.Get(ctx, storagePath)
+			ns, err := namespace.FromContext(ctx)
 			require.NoError(t, err)
-			require.NotNil(t, storageEntry, "expected mount entry to be written at %s", storagePath)
+			view := c.NamespaceView(ns)
 
-			testCore_Invalidate_sneakValueAroundCacheDelete(t, c, storagePath)
+			// 4. Manipulate mount table in storage: delete storageEntry
+			storageEntry, err := view.Get(ctx, entryPath)
+			require.NoError(t, err)
+			require.NotNil(t, storageEntry, "expected mount entry to be written at %s", view.Prefix()+entryPath)
+
+			testCore_Invalidate_sneakValueAroundCacheDelete(t, ctx, c, entryPath)
 
 			// 5. call invalidate
-			c.invalidateSynchronous(storagePath)
+			require.NoError(t, c.invalidateSynchronous(view.Prefix()+entryPath))
 
 			require.EventuallyWithT(t, func(collect *assert.CollectT) {
 				c.authLock.RLock()
@@ -996,10 +1205,10 @@ func TestCore_Invalidate_AuthMount(t *testing.T) {
 			callLogin(t, "unsupported path")
 
 			// 7. Manipulate mount table in storage: restore mount
-			testCore_Invalidate_sneakValueAroundCache(t, c, storageEntry)
+			testCore_Invalidate_sneakValueAroundCache(t, ctx, c, storageEntry)
 
 			// 8. call invalidate
-			c.invalidateSynchronous(storagePath)
+			require.NoError(t, c.invalidateSynchronous(view.Prefix()+entryPath))
 
 			require.EventuallyWithT(t, func(collect *assert.CollectT) {
 				c.authLock.RLock()
@@ -1011,20 +1220,20 @@ func TestCore_Invalidate_AuthMount(t *testing.T) {
 			require.EqualValues(t, 2, readCallCount.Load(), "expected two read calls")
 
 			// 9. Manipulate mount table in storage: taint mount
-			mountEntry := new(MountEntry)
+			mountEntry := new(routing.MountEntry)
 			require.NoError(t, jsonutil.DecodeJSON(storageEntry.Value, mountEntry))
 			mountEntry.Tainted = true
 
 			updatedData, err := jsonutil.EncodeJSON(mountEntry)
 			require.NoError(t, err)
 
-			testCore_Invalidate_sneakValueAroundCache(t, c, &logical.StorageEntry{
-				Key:   storagePath,
+			testCore_Invalidate_sneakValueAroundCache(t, ctx, c, &logical.StorageEntry{
+				Key:   entryPath,
 				Value: updatedData,
 			})
 
 			// 10. call invalidate
-			c.invalidateSynchronous(storagePath)
+			require.NoError(t, c.invalidateSynchronous(view.Prefix()+entryPath))
 
 			require.EventuallyWithT(t, func(collect *assert.CollectT) {
 				callLogin(collect, "unsupported path")
@@ -1046,6 +1255,16 @@ func TestCore_Invalidate_AuthMount_NonTransactional(t *testing.T) {
 				Path: "ns",
 			}
 			TestCoreCreateNamespaces(t, c, ns)
+
+			return namespace.ContextWithNamespace(t.Context(), ns)
+		},
+
+		"unsealed": func(t *testing.T, c *Core) context.Context {
+			ns := &namespace.Namespace{
+				ID:   "unsealed",
+				Path: "unsealed",
+			}
+			TestCoreCreateUnsealedNamespaces(t, c, ns)
 
 			return namespace.ContextWithNamespace(t.Context(), ns)
 		},
@@ -1102,8 +1321,6 @@ func TestCore_Invalidate_AuthMount_NonTransactional(t *testing.T) {
 			require.EqualValues(t, 1, factoryCallCount.Load(), "expected factory to be called exactly once")
 			require.Equal(t, mountTableCount+1, len(c.auth.Entries), "expected mount table to grew by one")
 
-			storagePath := "core/auth"
-
 			callLogin := func(collect require.TestingT, expectedErrors ...string) {
 				testCore_Invalidate_handleRequest(collect, ctx, c, &logical.Request{
 					Operation:   logical.ReadOperation,
@@ -1114,12 +1331,16 @@ func TestCore_Invalidate_AuthMount_NonTransactional(t *testing.T) {
 			callLogin(t)
 			require.EqualValues(t, 1, readCallCount.Load(), "expected one read call")
 
-			// 3. Manipulate mount table in storage: delete entry from mount table
-			storageEntry, err := c.barrier.Get(ctx, storagePath)
+			ns, err := namespace.FromContext(ctx)
 			require.NoError(t, err)
-			require.NotNil(t, storageEntry, "expected mount table to be written at %s", storagePath)
+			view := c.NamespaceView(ns)
 
-			mountTable := new(MountTable)
+			// 3. Manipulate mount table in storage: delete entry from mount table
+			storageEntry, err := view.Get(ctx, coreAuthConfigPath)
+			require.NoError(t, err)
+			require.NotNil(t, storageEntry, "expected mount table to be written at %s", view.Prefix()+coreAuthConfigPath)
+
+			mountTable := new(routing.MountTable)
 			require.NoError(t, jsonutil.DecodeJSON(storageEntry.Value, mountTable))
 
 			require.Equal(t, "my-auth/", mountTable.Entries[len(mountTable.Entries)-1].Path)
@@ -1128,13 +1349,13 @@ func TestCore_Invalidate_AuthMount_NonTransactional(t *testing.T) {
 			updatedData, err := jsonutil.EncodeJSON(mountTable)
 			require.NoError(t, err)
 
-			testCore_Invalidate_sneakValueAroundCache(t, c, &logical.StorageEntry{
-				Key:   storagePath,
+			testCore_Invalidate_sneakValueAroundCache(t, ctx, c, &logical.StorageEntry{
+				Key:   coreAuthConfigPath,
 				Value: updatedData,
 			})
 
 			// 4. call invalidate
-			c.invalidateSynchronous(storagePath)
+			require.NoError(t, c.invalidateSynchronous(view.Prefix()+coreAuthConfigPath))
 
 			require.EventuallyWithT(t, func(collect *assert.CollectT) {
 				c.authLock.RLock()
@@ -1149,10 +1370,10 @@ func TestCore_Invalidate_AuthMount_NonTransactional(t *testing.T) {
 			callLogin(t, "unsupported path")
 
 			// 6. Manipulate mount table in storage: restore mount
-			testCore_Invalidate_sneakValueAroundCache(t, c, storageEntry)
+			testCore_Invalidate_sneakValueAroundCache(t, ctx, c, storageEntry)
 
 			// 7. call invalidate
-			c.invalidateSynchronous(storagePath)
+			require.NoError(t, c.invalidateSynchronous(view.Prefix()+coreAuthConfigPath))
 
 			require.EventuallyWithT(t, func(collect *assert.CollectT) {
 				c.authLock.RLock()
@@ -1170,17 +1391,110 @@ func TestCore_Invalidate_AuthMount_NonTransactional(t *testing.T) {
 			updatedData, err = jsonutil.EncodeJSON(mountTable)
 			require.NoError(t, err)
 
-			testCore_Invalidate_sneakValueAroundCache(t, c, &logical.StorageEntry{
-				Key:   storagePath,
+			testCore_Invalidate_sneakValueAroundCache(t, ctx, c, &logical.StorageEntry{
+				Key:   coreAuthConfigPath,
 				Value: updatedData,
 			})
 
 			// 9. call invalidate
-			c.invalidateSynchronous(storagePath)
+			require.NoError(t, c.invalidateSynchronous(view.Prefix()+coreAuthConfigPath))
 
 			require.EventuallyWithT(t, func(collect *assert.CollectT) {
 				callLogin(collect, "unsupported path")
 			}, 10*time.Second, 10*time.Millisecond)
+		})
+	}
+}
+
+func TestCore_Invalidate_SealedNamespaces(t *testing.T) {
+	t.Parallel()
+	testCases := map[string]func(t *testing.T, c *Core) context.Context{
+		"sealed": func(t *testing.T, c *Core) context.Context {
+			ns := &namespace.Namespace{
+				ID:   "sealed",
+				Path: "sealed",
+			}
+			TestCoreCreateSealedNamespaces(t, c, ns)
+
+			return namespace.ContextWithNamespace(t.Context(), ns)
+		},
+
+		"child": func(t *testing.T, c *Core) context.Context {
+			ns := &namespace.Namespace{
+				ID:   "unsealed",
+				Path: "unsealed",
+			}
+			TestCoreCreateUnsealedNamespaces(t, c, ns)
+
+			child := &namespace.Namespace{
+				ID:   "child",
+				Path: "unsealed/child",
+			}
+
+			TestCoreCreateNamespaces(t, c, child)
+
+			require.NoError(t, c.namespaceStore.SealNamespace(namespace.RootContext(t.Context()), ns.Path))
+
+			return namespace.ContextWithNamespace(t.Context(), child)
+		},
+	}
+
+	for name, init := range testCases {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			c, _ := testCore_Invalidate_TestCore(t, nil)
+			ctx := init(t, c)
+
+			ns, err := namespace.FromContext(ctx)
+			require.NoError(t, err)
+			view := c.NamespaceView(ns)
+
+			nsRootView := barrier.NewView(c.barrier, view.Prefix())
+
+			require.NoError(
+				t,
+				logical.ScanViewPaginated(
+					t.Context(),
+					nsRootView,
+					hclog.NewNullLogger(),
+					50,
+					func(page int, index int, path string) (cont bool, err error) {
+						// Bypass the security barrier and write garbage.
+						testCore_Invalidate_sneakValueAroundCache(
+							t,
+							namespace.RootContext(ctx),
+							c,
+							&logical.StorageEntry{
+								Key:   path,
+								Value: []byte("absolute-garbage"),
+							},
+						)
+
+						// Call invalidate on the full path; this should not err.
+						require.NoError(t, c.invalidateSynchronous(view.Prefix()+path))
+
+						return true, nil
+					},
+				),
+			)
+
+			// Try invalidating the namespace entry itself.
+			parentPath, ok := ns.ParentPath()
+			require.True(t, ok, "expected namespace to have parent")
+
+			parentNs, err := c.namespaceStore.GetNamespaceByPath(namespace.RootContext(t.Context()), parentPath)
+			require.NoError(t, err)
+			require.NotNil(t, parentNs)
+
+			childNsPath := path.Join(namespaceStoreSubPath, ns.UUID)
+			if parentNs.UUID != namespace.RootNamespaceUUID {
+				childNsPath = path.Join(barrier.NamespacePrefix, parentNs.UUID, childNsPath)
+			}
+
+			// Call invalidate on the full path; this should not err. We've
+			// not made any updates but we're more interested in downstream
+			// effects.
+			require.NoError(t, c.invalidateSynchronous(childNsPath))
 		})
 	}
 }

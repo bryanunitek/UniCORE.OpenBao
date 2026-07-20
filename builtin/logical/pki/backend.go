@@ -248,14 +248,10 @@ func Backend(conf *logical.BackendConfig) *backend {
 		// We specifically do NOT add acme/new-eab to this as it should be auth'd
 	}
 
-	b.tidyCASGuard = new(uint32)
-	b.tidyCancelCAS = new(uint32)
 	b.tidyStatus = &tidyStatus{state: tidyStatusInactive}
 	b.storage = conf.StorageView
 	b.backendUUID = conf.BackendUUID
 	b.backgroundCtx, b.backgroundCtxCancel = context.WithCancelCause(context.Background())
-
-	b.pkiStorageVersion.Store(0)
 
 	// b isn't yet initialized with SystemView state; calling b.System() will
 	// result in a nil pointer dereference. Instead query BackendConfig's
@@ -268,12 +264,7 @@ func Backend(conf *logical.BackendConfig) *backend {
 	b.lastTidy = time.Now()
 
 	// Metrics initialization for count of certificates in storage
-	b.certCountEnabled = &atomic.Bool{}
-	b.publishCertCountMetrics = &atomic.Bool{}
-	b.certsCounted = &atomic.Bool{}
 	b.certCountError = "Initialize Not Yet Run, Cert Counts Unavailable"
-	b.certCount = &atomic.Uint32{}
-	b.revokedCertCount = &atomic.Uint32{}
 	b.possibleDoubleCountedSerials = make([]string, 0, 250)
 	b.possibleDoubleCountedRevokedSerials = make([]string, 0, 250)
 
@@ -287,8 +278,8 @@ type backend struct {
 	backendUUID         string
 	storage             logical.Storage
 	revokeStorageLock   sync.RWMutex
-	tidyCASGuard        *uint32
-	tidyCancelCAS       *uint32
+	tidyCASGuard        atomic.Bool
+	tidyCancelCAS       atomic.Bool
 	backgroundCtx       context.Context
 	backgroundCtxCancel context.CancelCauseFunc
 
@@ -296,16 +287,16 @@ type backend struct {
 	tidyStatus     *tidyStatus
 	lastTidy       time.Time
 
-	certCountEnabled                    *atomic.Bool
-	publishCertCountMetrics             *atomic.Bool
-	certCount                           *atomic.Uint32
-	revokedCertCount                    *atomic.Uint32
-	certsCounted                        *atomic.Bool
+	certCountEnabled                    atomic.Bool
+	publishCertCountMetrics             atomic.Bool
+	certCount                           atomic.Uint32
+	revokedCertCount                    atomic.Uint32
+	certsCounted                        atomic.Bool
 	certCountError                      string
 	possibleDoubleCountedSerials        []string
 	possibleDoubleCountedRevokedSerials []string
 
-	pkiStorageVersion atomic.Value
+	pkiStorageVersion atomic.Bool
 	crlBuilder        *crlBuilder
 
 	// Write lock around issuers and keys.
@@ -451,8 +442,7 @@ func (b *backend) useLegacyBundleCaStorage() bool {
 	// with the old bundle format (e.g., issuing and revoking certs), until
 	// the primary cluster's active node is upgraded to the newer Vault version
 	// and the storage is migrated to the new format.
-	version := b.pkiStorageVersion.Load()
-	return version == nil || version == 0
+	return !b.pkiStorageVersion.Load()
 }
 
 func (b *backend) updatePkiStorageVersion(ctx context.Context, grabIssuersLock bool) {
@@ -473,11 +463,7 @@ func (b *backend) updatePkiStorageVersion(ctx context.Context, grabIssuersLock b
 		defer b.issuersLock.Unlock()
 	}
 
-	if info.isRequired {
-		b.pkiStorageVersion.Store(0)
-	} else {
-		b.pkiStorageVersion.Store(1)
-	}
+	b.pkiStorageVersion.Store(!info.isRequired)
 }
 
 func (b *backend) invalidate(ctx context.Context, key string) {
@@ -596,7 +582,7 @@ func (b *backend) periodicFunc(ctx context.Context, request *logical.Request) er
 
 		// Ensure a tidy isn't already running... If it is, we'll trigger
 		// again when the running one finishes.
-		if !atomic.CompareAndSwapUint32(b.tidyCASGuard, 0, 1) {
+		if !b.tidyCASGuard.CompareAndSwap(false, true) {
 			return nil
 		}
 

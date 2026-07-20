@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"slices"
 	"strings"
 	"time"
 
@@ -112,6 +113,15 @@ accepts a comma-separated string or list of domains.`,
 			Required: true,
 			Description: `If set, Allowed domains can be specified using identity template policies.
 				Non-templated domains are also permitted.`,
+		},
+		"allow_globs_in_identity_templates": {
+			Type:     framework.TypeBool,
+			Required: true,
+			Description: `If set and templating is enabled, the values substituted in
+				for allowed_uri_sans_template and allowed_domains template expression
+				might contain a wildcard characters ('*' and '+'). This can enable
+				injection attacks. Only use this, if the data used by the templates
+				is trusted.`,
 		},
 		"allow_bare_domains": {
 			Type:     framework.TypeBool,
@@ -504,6 +514,15 @@ accepts a comma-separated string or list of domains.`,
 				Type: framework.TypeBool,
 				Description: `If set, Allowed domains can be specified using identity template policies.
 				Non-templated domains are also permitted.`,
+				Default: false,
+			},
+			"allow_globs_in_identity_templates": {
+				Type: framework.TypeBool,
+				Description: `If set and templating is enabled, the values substituted in
+					for allowed_uri_sans_template and allowed_domains template expression
+					might contain a wildcard characters ('*' and '+'). This can enable
+					injection attacks. Only use this, if the data used by the templates
+					is trusted.`,
 				Default: false,
 			},
 			"allow_bare_domains": {
@@ -995,14 +1014,7 @@ func (b *backend) getRole(ctx context.Context, s logical.Storage, n string) (*ro
 		modified = true
 	}
 	if result.AllowedBaseDomain != "" {
-		found := false
-		for _, v := range result.AllowedDomains {
-			if v == result.AllowedBaseDomain {
-				found = true
-				break
-			}
-		}
-		if !found {
+		if !slices.Contains(result.AllowedDomains, result.AllowedBaseDomain) {
 			result.AllowedDomains = append(result.AllowedDomains, result.AllowedBaseDomain)
 		}
 		result.AllowedBaseDomain = ""
@@ -1060,6 +1072,16 @@ func (b *backend) getRole(ctx context.Context, s logical.Storage, n string) (*ro
 	// Update CN Validations to be the present default, "email,hostname"
 	if len(result.CNValidations) == 0 {
 		result.CNValidations = []string{"email", "hostname"}
+		modified = true
+	}
+
+	// Update not_after_bound, not_before_bound
+	if result.NotAfterBound == "" {
+		result.NotAfterBound = PermitNotAfterBound.String()
+		modified = true
+	}
+	if result.NotBeforeBound == "" {
+		result.NotBeforeBound = PermitNotBeforeBound.String()
 		modified = true
 	}
 
@@ -1138,6 +1160,7 @@ func (b *backend) pathRoleCreate(ctx context.Context, req *logical.Request, data
 		AllowLocalhost:                data.Get("allow_localhost").(bool),
 		AllowedDomains:                data.Get("allowed_domains").([]string),
 		AllowedDomainsTemplate:        data.Get("allowed_domains_template").(bool),
+		AllowGlobsInIdentityTemplates: data.Get("allow_globs_in_identity_templates").(bool),
 		AllowBareDomains:              data.Get("allow_bare_domains").(bool),
 		AllowSubdomains:               data.Get("allow_subdomains").(bool),
 		AllowGlobDomains:              data.Get("allow_glob_domains").(bool),
@@ -1284,7 +1307,7 @@ func validateNotAfterBound(notAfterBound string) (*logical.Response, error) {
 	default:
 		_, err = time.Parse(time.RFC3339, notAfterBound)
 		if err != nil {
-			resp = logical.ErrorResponse("Unknown value for field `not_after_bound`. Possible values are `forbid`, `ttl`, or an explicit timestamp.")
+			resp = logical.ErrorResponse("Unknown value for field `not_after_bound`. Possible values are `permit`, `ttl-limited`, `forbid`, or an explicit timestamp.")
 		}
 	}
 	return resp, err
@@ -1302,7 +1325,7 @@ func validateNoBeforeBound(notBeforebound string) (*logical.Response, error) {
 	case PermitNotBeforeBound.String():
 	// nothing to do
 	default:
-		resp = logical.ErrorResponse("Unknown value for field `not_before_bound`. Possible values are `permit` or `forbid`")
+		resp = logical.ErrorResponse("Unknown value for field `not_before_bound`. Possible values are `permit` `duration` or `forbid`")
 		err = errors.New("unknown value")
 	}
 	return resp, err
@@ -1391,6 +1414,7 @@ func (b *backend) pathRolePatch(ctx context.Context, req *logical.Request, data 
 		AllowLocalhost:                data.GetWithExplicitDefault("allow_localhost", oldEntry.AllowLocalhost).(bool),
 		AllowedDomains:                data.GetWithExplicitDefault("allowed_domains", oldEntry.AllowedDomains).([]string),
 		AllowedDomainsTemplate:        data.GetWithExplicitDefault("allowed_domains_template", oldEntry.AllowedDomainsTemplate).(bool),
+		AllowGlobsInIdentityTemplates: data.GetWithExplicitDefault("allow_globs_in_identity_templates", oldEntry.AllowGlobsInIdentityTemplates).(bool),
 		AllowBareDomains:              data.GetWithExplicitDefault("allow_bare_domains", oldEntry.AllowBareDomains).(bool),
 		AllowSubdomains:               data.GetWithExplicitDefault("allow_subdomains", oldEntry.AllowSubdomains).(bool),
 		AllowGlobDomains:              data.GetWithExplicitDefault("allow_glob_domains", oldEntry.AllowGlobDomains).(bool),
@@ -1631,6 +1655,7 @@ type roleEntry struct {
 	AllowedDomainsOld             string        `json:"allowed_domains,omitempty"`
 	AllowedDomains                []string      `json:"allowed_domains_list"`
 	AllowedDomainsTemplate        bool          `json:"allowed_domains_template"`
+	AllowGlobsInIdentityTemplates bool          `json:"allow_globs_in_identity_templates"`
 	AllowBaseDomain               bool          `json:"allow_base_domain"`
 	AllowBareDomains              bool          `json:"allow_bare_domains"`
 	AllowTokenDisplayName         bool          `json:"allow_token_displayname"`
@@ -1699,6 +1724,7 @@ func (r *roleEntry) ToResponseData() map[string]interface{} {
 		"allow_localhost":                    r.AllowLocalhost,
 		"allowed_domains":                    r.AllowedDomains,
 		"allowed_domains_template":           r.AllowedDomainsTemplate,
+		"allow_globs_in_identity_templates":  r.AllowGlobsInIdentityTemplates,
 		"allow_bare_domains":                 r.AllowBareDomains,
 		"allow_token_displayname":            r.AllowTokenDisplayName,
 		"allow_subdomains":                   r.AllowSubdomains,

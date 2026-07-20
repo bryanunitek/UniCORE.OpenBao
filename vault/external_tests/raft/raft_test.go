@@ -5,7 +5,6 @@ package rafttests
 
 import (
 	"bytes"
-	"context"
 	"crypto/md5"
 	"errors"
 	"fmt"
@@ -13,7 +12,6 @@ import (
 	"net/http"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -22,22 +20,25 @@ import (
 	"github.com/openbao/openbao/api/v2"
 	credUserpass "github.com/openbao/openbao/builtin/credential/userpass"
 	"github.com/openbao/openbao/helper/benchhelpers"
+	"github.com/openbao/openbao/helper/configutil"
 	"github.com/openbao/openbao/helper/namespace"
 	"github.com/openbao/openbao/helper/testhelpers"
 	"github.com/openbao/openbao/helper/testhelpers/corehelpers"
 	"github.com/openbao/openbao/helper/testhelpers/teststorage"
 	vaulthttp "github.com/openbao/openbao/http"
-	"github.com/openbao/openbao/internalshared/configutil"
 	"github.com/openbao/openbao/physical/raft"
+	"github.com/openbao/openbao/sdk/v2/helper/consts"
 	"github.com/openbao/openbao/sdk/v2/logical"
 	"github.com/openbao/openbao/vault"
 	vaultseal "github.com/openbao/openbao/vault/seal"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/net/http2"
 )
 
 type RaftClusterOpts struct {
 	DisableFollowerJoins           bool
+	DisableStandbyReads            bool
 	InmemCluster                   bool
 	EnableAutopilot                bool
 	PhysicalFactoryConfig          map[string]interface{}
@@ -70,6 +71,7 @@ func raftCluster(t testing.TB, ropts *RaftClusterOpts) (*vault.TestCluster, *vau
 	opts.NumCores = ropts.NumCores
 	opts.VersionMap = ropts.VersionMap
 	opts.EffectiveSDKVersionMap = ropts.EffectiveSDKVersionMap
+	opts.DisableStandbyReads = ropts.DisableStandbyReads
 
 	teststorage.RaftBackendSetup(conf, &opts)
 
@@ -108,7 +110,7 @@ func TestRaft_BoltDBMetrics(t *testing.T) {
 	leaderClient := cluster.Cores[0].Client
 
 	// Write a few keys
-	for i := 0; i < 50; i++ {
+	for i := range 50 {
 		_, err := leaderClient.Logical().Write(fmt.Sprintf("secret/%d", i), map[string]interface{}{
 			fmt.Sprintf("foo%d", i): fmt.Sprintf("bar%d", i),
 		})
@@ -158,7 +160,7 @@ func TestRaft_RetryAutoJoin(t *testing.T) {
 
 	addressProvider := &testhelpers.TestRaftServerAddressProvider{Cluster: cluster}
 	leaderCore := cluster.Cores[0]
-	atomic.StoreUint32(&vault.TestingUpdateClusterAddr, 1)
+	vault.TestingUpdateClusterAddr.Store(true)
 
 	{
 		testhelpers.EnsureCoreSealed(t, leaderCore)
@@ -180,7 +182,7 @@ func TestRaft_RetryAutoJoin(t *testing.T) {
 		core := cluster.Cores[1]
 		core.UnderlyingRawStorage.(*raft.RaftBackend).SetServerAddressProvider(addressProvider)
 
-		_, err := core.JoinRaftCluster(namespace.RootContext(context.Background()), leaderInfos, false)
+		_, err := core.JoinRaftCluster(namespace.RootContext(t.Context()), leaderInfos, false)
 		require.NoError(t, err)
 	}
 
@@ -206,7 +208,7 @@ func TestRaft_Retry_Join(t *testing.T) {
 
 	leaderCore := cluster.Cores[0]
 	leaderAPI := leaderCore.Client.Address()
-	atomic.StoreUint32(&vault.TestingUpdateClusterAddr, 1)
+	vault.TestingUpdateClusterAddr.Store(true)
 
 	{
 		testhelpers.EnsureCoreSealed(t, leaderCore)
@@ -228,7 +230,7 @@ func TestRaft_Retry_Join(t *testing.T) {
 			t.Helper()
 			defer wg.Done()
 			core.UnderlyingRawStorage.(*raft.RaftBackend).SetServerAddressProvider(addressProvider)
-			_, err := core.JoinRaftCluster(namespace.RootContext(context.Background()), leaderInfos, false)
+			_, err := core.JoinRaftCluster(namespace.RootContext(t.Context()), leaderInfos, false)
 			if err != nil {
 				t.Error(err)
 			}
@@ -269,7 +271,7 @@ func TestRaft_Join(t *testing.T) {
 
 	leaderCore := cluster.Cores[0]
 	leaderAPI := leaderCore.Client.Address()
-	atomic.StoreUint32(&vault.TestingUpdateClusterAddr, 1)
+	vault.TestingUpdateClusterAddr.Store(true)
 
 	// Seal the leader so we can install an address provider
 	{
@@ -410,7 +412,7 @@ func TestRaft_NodeIDHeader(t *testing.T) {
 					t.Fatal("nil response")
 				}
 
-				rniHeader := resp.Header.Get("X-Vault-Raft-Node-ID")
+				rniHeader := resp.Header.Get(consts.RaftNodeIDHeaderName)
 				nodeID := c.GetRaftNodeID()
 
 				if tc.headerPresent && rniHeader == "" {
@@ -454,7 +456,7 @@ func TestRaft_SnapshotAPI(t *testing.T) {
 	leaderClient := cluster.Cores[0].Client
 
 	// Write a few keys
-	for i := 0; i < 10; i++ {
+	for i := range 10 {
 		_, err := leaderClient.Logical().Write(fmt.Sprintf("secret/%d", i), map[string]interface{}{
 			"test": "data",
 		})
@@ -523,7 +525,7 @@ func TestRaft_SnapshotAPI_MidstreamFailure(t *testing.T) {
 	// Write a bunch of keys; if too few, the detection code in api.RaftSnapshot
 	// will never make it into the tar part, it'll fail merely when trying to
 	// decompress the stream.
-	for i := 0; i < 1000; i++ {
+	for i := range 1000 {
 		_, err := leaderClient.Logical().Write(fmt.Sprintf("secret/%d", i), map[string]interface{}{
 			"test": "data",
 		})
@@ -596,7 +598,7 @@ func TestRaft_SnapshotAPI_Rotate_Backward(t *testing.T) {
 			leaderClient := cluster.Cores[0].Client
 
 			// Write a few keys
-			for i := 0; i < 10; i++ {
+			for i := range 10 {
 				_, err := leaderClient.Logical().Write(fmt.Sprintf("secret/%d", i), map[string]interface{}{
 					"test": "data",
 				})
@@ -624,7 +626,7 @@ func TestRaft_SnapshotAPI_Rotate_Backward(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			defer resp.Body.Close()
+			defer resp.Body.Close() //nolint:errcheck
 
 			snap, err := io.ReadAll(resp.Body)
 			if err != nil {
@@ -654,9 +656,7 @@ func TestRaft_SnapshotAPI_Rotate_Backward(t *testing.T) {
 
 				testhelpers.EnsureStableActiveNode(t, cluster)
 				testhelpers.WaitForActiveNodeAndStandbys(t, cluster)
-			}
 
-			if tCaseLocal.Rotate {
 				// Restore snapshot, should fail.
 				req = leaderClient.NewRequest("POST", "/v1/sys/storage/raft/snapshot")
 				req.Body = bytes.NewBuffer(snap)
@@ -682,7 +682,7 @@ func TestRaft_SnapshotAPI_Rotate_Backward(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			resp, err = client.Do(httpReq)
+			_, err = client.Do(httpReq)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -763,7 +763,7 @@ func TestRaft_SnapshotAPI_Rotate_Forward(t *testing.T) {
 			leaderClient := cluster.Cores[0].Client
 
 			// Write a few keys
-			for i := 0; i < 10; i++ {
+			for i := range 10 {
 				_, err := leaderClient.Logical().Write(fmt.Sprintf("secret/%d", i), map[string]interface{}{
 					"test": "data",
 				})
@@ -793,7 +793,7 @@ func TestRaft_SnapshotAPI_Rotate_Forward(t *testing.T) {
 			}
 
 			snap, err := io.ReadAll(resp.Body)
-			resp.Body.Close()
+			resp.Body.Close() //nolint:errcheck
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -839,7 +839,7 @@ func TestRaft_SnapshotAPI_Rotate_Forward(t *testing.T) {
 			}
 
 			snap2, err := io.ReadAll(resp.Body)
-			resp.Body.Close()
+			resp.Body.Close() //nolint:errcheck
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -855,7 +855,7 @@ func TestRaft_SnapshotAPI_Rotate_Forward(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			resp, err = client.Do(httpReq)
+			_, err = client.Do(httpReq)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -889,7 +889,7 @@ func TestRaft_SnapshotAPI_Rotate_Forward(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			resp, err = client.Do(httpReq)
+			_, err = client.Do(httpReq)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -931,6 +931,87 @@ func TestRaft_SnapshotAPI_Rotate_Forward(t *testing.T) {
 	}
 }
 
+func TestRaft_RotateKeyring(t *testing.T) {
+	t.Parallel()
+
+	cluster, _ := raftCluster(t, &RaftClusterOpts{})
+	defer cluster.Cleanup()
+
+	leaderClient := cluster.Cores[0].Client
+	rootCtx := namespace.RootContext(t.Context())
+	output, err := leaderClient.Sys().CreateNamespaceWithContext(rootCtx, "test-ns", &api.CreateNamespaceInput{})
+	require.NoError(t, err)
+	ns := &namespace.Namespace{ID: output.ID, Path: output.Path, UUID: output.UUID}
+
+	tt := []struct {
+		name      string
+		namespace *namespace.Namespace
+	}{
+		{
+			name:      "root namespace",
+			namespace: namespace.RootNamespace,
+		},
+		{
+			name:      "other namespace",
+			namespace: ns,
+		},
+	}
+
+	for _, tc := range tt {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := namespace.ContextWithNamespace(t.Context(), tc.namespace)
+
+			// Write a secret.
+			_, err := leaderClient.Logical().WriteWithContext(ctx, "secret/foo", map[string]interface{}{
+				"test": "data",
+			})
+			require.NoError(t, err)
+
+			verifyRead := func(path string) {
+				require.EventuallyWithT(t, func(collect *assert.CollectT) {
+					for _, c := range cluster.Cores {
+						res, err := c.Client.Logical().ReadWithContext(ctx, path)
+						require.NoError(collect, err)
+						require.NotEmpty(collect, res)
+						require.Equal(collect, "data", res.Data["test"].(string))
+					}
+				}, time.Second, 100*time.Millisecond)
+			}
+
+			// Verify written secret.
+			verifyRead("secret/foo")
+
+			status, err := leaderClient.Sys().KeyStatusWithContext(ctx)
+			require.NoError(t, err)
+			prevTerm := status.Term
+
+			// Rotate keyring.
+			require.NoError(t, leaderClient.Sys().RotateKeyringWithContext(ctx))
+
+			// Write secret after keyring rotation.
+			_, err = leaderClient.Logical().WriteWithContext(ctx, "secret/bar", map[string]interface{}{
+				"test": "data",
+			})
+			require.NoError(t, err)
+
+			// Verify standby nodes have upgraded their keyrings.
+			require.EventuallyWithT(t, func(collect *assert.CollectT) {
+				for _, c := range cluster.Cores {
+					status, err := c.Client.Sys().KeyStatusWithContext(ctx)
+					require.NoError(collect, err)
+					require.Equal(collect, prevTerm+1, status.Term)
+				}
+			}, 5*time.Second, 100*time.Millisecond)
+
+			// Verify we can read secret written with previous term keyring.
+			verifyRead("secret/foo")
+
+			// Verify we can read secret written with most recent keyring.
+			verifyRead("secret/bar")
+		})
+	}
+}
+
 func TestRaft_SnapshotAPI_DifferentCluster(t *testing.T) {
 	t.Parallel()
 	cluster, _ := raftCluster(t, nil)
@@ -939,7 +1020,7 @@ func TestRaft_SnapshotAPI_DifferentCluster(t *testing.T) {
 	leaderClient := cluster.Cores[0].Client
 
 	// Write a few keys
-	for i := 0; i < 10; i++ {
+	for i := range 10 {
 		_, err := leaderClient.Logical().Write(fmt.Sprintf("secret/%d", i), map[string]interface{}{
 			"test": "data",
 		})
@@ -969,7 +1050,7 @@ func TestRaft_SnapshotAPI_DifferentCluster(t *testing.T) {
 	}
 
 	snap, err := io.ReadAll(resp.Body)
-	resp.Body.Close()
+	resp.Body.Close() //nolint:errcheck
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1016,7 +1097,7 @@ func TestRaft_SnapshotAPI_DifferentCluster(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		resp, err = client.Do(httpReq)
+		_, err = client.Do(httpReq)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1068,7 +1149,7 @@ func TestRaft_Join_InitStatus(t *testing.T) {
 
 	leaderCore := cluster.Cores[0]
 	leaderAPI := leaderCore.Client.Address()
-	atomic.StoreUint32(&vault.TestingUpdateClusterAddr, 1)
+	vault.TestingUpdateClusterAddr.Store(true)
 
 	// Seal the leader so we can install an address provider
 	{

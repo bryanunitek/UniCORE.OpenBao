@@ -33,7 +33,7 @@ func (c *SecretsListCommand) Help() string {
 	helpText := `
 Usage: bao secrets list [options]
 
-  Lists the enabled secret engines on the Vault server. This command also
+  Lists the enabled secret engines on the OpenBao server. This command also
   outputs information about the enabled path including configured TTLs and
   human-friendly descriptions. A TTL of "system" indicates that the system
   default is in use.
@@ -162,7 +162,8 @@ func (c *SecretsListCommand) detailedMounts(mounts map[string]*api.MountOutput) 
 
 		pluginName := mount.Type
 
-		out = append(out, fmt.Sprintf("%s | %s | %s | %s | %s | %t | %s | %t | %v | %s | %s | %s | %s | %s | %s | %s",
+		out = append(out, fmt.Sprintf(
+			"%s | %s | %s | %s | %s | %t | %s | %t | %v | %s | %s | %s | %s | %s | %s | %s",
 			path,
 			pluginName,
 			mount.Accessor,

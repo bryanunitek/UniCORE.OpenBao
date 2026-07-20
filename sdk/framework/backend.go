@@ -10,14 +10,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"regexp"
 	"sort"
 	"strings"
 	"sync"
 	"time"
-
-	"github.com/openbao/go-kms-wrapping/entropy/v2"
 
 	jsonpatch "github.com/evanphx/json-patch/v5"
 	log "github.com/hashicorp/go-hclog"
@@ -171,9 +170,7 @@ func (b *Backend) HandleExistenceCheck(ctx context.Context, req *logical.Request
 	// Build up the data for the route, with the URL taking priority
 	// for the fields over the PUT data.
 	raw := make(map[string]interface{}, len(path.Fields))
-	for k, v := range req.Data {
-		raw[k] = v
-	}
+	maps.Copy(raw, req.Data)
 	for k, v := range captures {
 		raw[k] = v
 	}
@@ -401,14 +398,8 @@ func (b *Backend) Setup(ctx context.Context, config *logical.BackendConfig) erro
 	return nil
 }
 
-// GetRandomReader returns an io.Reader to use for generating key material in
-// backends. If the backend has access to an external entropy source it will
-// return that, otherwise it returns crypto/rand.Reader.
+// GetRandomReader returns crypto/rand.Reader.
 func (b *Backend) GetRandomReader() io.Reader {
-	if sourcer, ok := b.System().(entropy.Sourcer); ok {
-		return entropy.NewReader(sourcer)
-	}
-
 	return rand.Reader
 }
 
@@ -693,9 +684,10 @@ type FieldSchema struct {
 	Default     interface{}
 	Description string
 
-	// The Required and Deprecated members are only used by openapi, and are not actually
-	// used by the framework.
-	Required   bool
+	// Whether this field is required.
+	Required bool
+
+	// Whether this field is deprecated. This only shows in the help text.
 	Deprecated bool
 
 	// Query indicates this field will be sent as a query parameter:

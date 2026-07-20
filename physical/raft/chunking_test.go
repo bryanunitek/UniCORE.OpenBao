@@ -5,7 +5,6 @@ package raft
 
 import (
 	"bytes"
-	"context"
 	"fmt"
 	"testing"
 
@@ -28,7 +27,7 @@ func TestRaft_Chunking_Lifecycle(t *testing.T) {
 	require := require.New(t)
 	assert := assert.New(t)
 
-	b, _ := GetRaft(t, true, false)
+	b := GetRaft(t, true, false)
 
 	t.Log("applying configuration")
 
@@ -52,7 +51,7 @@ func TestRaft_Chunking_Lifecycle(t *testing.T) {
 	var logs []*raft.Log
 	for i, b := range cmdBytes {
 		// Stage multiple operations so we can test restoring across multiple opnums
-		for j := 0; j < 10; j++ {
+		for j := range 10 {
 			chunkInfo := &raftchunkingtypes.ChunkInfo{
 				OpNum:       uint64(32 + j),
 				SequenceNum: uint32(i),
@@ -112,7 +111,7 @@ func TestFSM_Chunking_TermChange(t *testing.T) {
 	require := require.New(t)
 	assert := assert.New(t)
 
-	b, _ := GetRaft(t, true, false)
+	b := GetRaft(t, true, false)
 
 	t.Log("applying configuration")
 
@@ -184,7 +183,7 @@ func TestFSM_Chunking_TermChange(t *testing.T) {
 
 func TestRaft_Chunking_AppliedIndex(t *testing.T) {
 	// t.Parallel() this can't be parallel, because we modify a global variable "raftchunking.ChunkSize"
-	raft, _ := GetRaft(t, true, false)
+	raft := GetRaft(t, true, false)
 
 	// Lower the size for tests
 	originalChunkSize := raftchunking.ChunkSize
@@ -199,7 +198,7 @@ func TestRaft_Chunking_AppliedIndex(t *testing.T) {
 	}
 
 	// Write a value to fastforward the index
-	err = raft.Put(context.Background(), &physical.Entry{
+	err = raft.Put(t.Context(), &physical.Entry{
 		Key:   "key",
 		Value: []byte("test"),
 	})
@@ -209,8 +208,8 @@ func TestRaft_Chunking_AppliedIndex(t *testing.T) {
 
 	currentIndex := raft.AppliedIndex()
 	// Write some data
-	for i := 0; i < 10; i++ {
-		err := raft.Put(context.Background(), &physical.Entry{
+	for i := range 10 {
+		err := raft.Put(t.Context(), &physical.Entry{
 			Key:   fmt.Sprintf("key-%d", i),
 			Value: val,
 		})
@@ -226,8 +225,8 @@ func TestRaft_Chunking_AppliedIndex(t *testing.T) {
 		t.Fatalf("Did not apply chunks as expected, applied index = %d - %d = %d", newIndex, currentIndex, newIndex-currentIndex)
 	}
 
-	for i := 0; i < 10; i++ {
-		entry, err := raft.Get(context.Background(), fmt.Sprintf("key-%d", i))
+	for i := range 10 {
+		entry, err := raft.Get(t.Context(), fmt.Sprintf("key-%d", i))
 		if err != nil {
 			t.Fatal(err)
 		}

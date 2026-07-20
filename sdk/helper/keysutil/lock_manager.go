@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"io"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/openbao/openbao/sdk/v2/helper/jsonutil"
@@ -265,7 +264,7 @@ func (lm *LockManager) BackupPolicy(ctx context.Context, storage logical.Storage
 		}
 	}
 
-	if atomic.LoadUint32(&p.deleted) == 1 {
+	if p.deleted.Load() {
 		return "", fmt.Errorf("key %q not found", name)
 	}
 
@@ -304,7 +303,7 @@ func (lm *LockManager) GetPolicyWithLockType(ctx context.Context, req PolicyRequ
 	}
 	if ok {
 		p = pRaw.(*Policy)
-		if atomic.LoadUint32(&p.deleted) == 1 {
+		if p.deleted.Load() {
 			return nil, false, nil
 		}
 		p.Lock(exclusive)
@@ -339,7 +338,7 @@ func (lm *LockManager) GetPolicyWithLockType(ctx context.Context, req PolicyRequ
 	}
 	if ok {
 		p = pRaw.(*Policy)
-		if atomic.LoadUint32(&p.deleted) == 1 {
+		if p.deleted.Load() {
 			return nil, false, nil
 		}
 		retP = p
@@ -467,7 +466,7 @@ func (lm *LockManager) ImportPolicy(ctx context.Context, req PolicyRequest, key 
 	}
 	if ok {
 		p = pRaw.(*Policy)
-		if atomic.LoadUint32(&p.deleted) == 1 {
+		if p.deleted.Load() {
 			return nil
 		}
 	}
@@ -547,7 +546,7 @@ func (lm *LockManager) DeletePolicy(ctx context.Context, storage logical.Storage
 		return errors.New("deletion is not allowed for this key")
 	}
 
-	atomic.StoreUint32(&p.deleted, 1)
+	p.deleted.Store(true)
 
 	if lm.useCache {
 		lm.cache.Delete(name)

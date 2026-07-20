@@ -20,7 +20,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/cenkalti/backoff/v4"
+	"github.com/cenkalti/backoff/v5"
 	"github.com/containerd/errdefs"
 	"github.com/hashicorp/go-uuid"
 	"github.com/moby/go-archive"
@@ -28,7 +28,6 @@ import (
 	"github.com/moby/moby/api/types/container"
 	"github.com/moby/moby/api/types/mount"
 	"github.com/moby/moby/api/types/network"
-	"github.com/moby/moby/api/types/strslice"
 	"github.com/moby/moby/client"
 )
 
@@ -280,17 +279,29 @@ func (d *Runner) StartNewService(ctx context.Context, addSuffix, forceLocalAddr 
 
 	cleanup := func() {
 		for range 10 {
-			_, err := d.DockerAPI.ContainerRemove(ctx, result.Container.ID, client.ContainerRemoveOptions{Force: true})
-			if err == nil || errdefs.IsNotFound(err) {
+			if func() bool {
+				// Container removal may take a little bit, but do not
+				// prematurely time out because our parent context was
+				// cancelled on us.
+				cleanupCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+				defer cancel()
+
+				// We don't necessarily have anywhere to surface this error
+				// so swallow it.
+				_, err := d.DockerAPI.ContainerRemove(cleanupCtx, result.Container.ID, client.ContainerRemoveOptions{Force: true})
+				if err == nil || errdefs.IsNotFound(err) {
+					return true
+				}
+
+				return false
+			}() {
+				// OK to return early
 				return
 			}
+
 			time.Sleep(1 * time.Second)
 		}
 	}
-
-	bo := backoff.NewExponentialBackOff()
-	bo.MaxInterval = time.Second * 5
-	bo.MaxElapsedTime = 2 * time.Minute
 
 	pieces := strings.Split(result.Addrs[0], ":")
 	portInt, err := strconv.Atoi(pieces[1])
@@ -298,23 +309,26 @@ func (d *Runner) StartNewService(ctx context.Context, addSuffix, forceLocalAddr 
 		return nil, "", err
 	}
 
-	var config ServiceConfig
-	err = backoff.Retry(func() error {
+	bo := backoff.NewExponentialBackOff()
+	bo.MaxInterval = time.Second * 5
+
+	op := func() (ServiceConfig, error) {
 		container, err := d.DockerAPI.ContainerInspect(ctx, result.Container.ID, client.ContainerInspectOptions{})
 		if err != nil || !container.Container.State.Running {
-			return backoff.Permanent(fmt.Errorf("failed inspect or container %q not running: %w", result.Container.ID, err))
+			return nil, backoff.Permanent(fmt.Errorf("failed inspect or container %q not running: %w", result.Container.ID, err))
 		}
 
 		c, err := connect(ctx, pieces[0], portInt)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		if c == nil {
-			return errors.New("service adapter returned nil error and config")
+			return nil, errors.New("service adapter returned nil error and config")
 		}
-		config = c
-		return nil
-	}, bo)
+		return c, nil
+	}
+
+	config, err := backoff.Retry(ctx, op, backoff.WithBackOff(bo), backoff.WithMaxElapsedTime(2*time.Minute))
 	if err != nil {
 		if !d.RunOptions.DoNotAutoRemove {
 			cleanup()
@@ -370,7 +384,7 @@ func (d *Runner) Start(ctx context.Context, addSuffix, forceLocalAddr bool) (*St
 		}
 	}
 	if len(d.RunOptions.Entrypoint) > 0 {
-		cfg.Entrypoint = strslice.StrSlice(d.RunOptions.Entrypoint)
+		cfg.Entrypoint = d.RunOptions.Entrypoint
 	}
 
 	hostConfig := &container.HostConfig{

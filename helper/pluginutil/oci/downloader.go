@@ -55,7 +55,16 @@ func (d *PluginDownloader) ReconcilePlugins(ctx context.Context) error {
 		return nil
 	}
 
+	if d.pluginDirectory == "" {
+		return errors.New("plugin directory is not configured")
+	}
+
 	for _, pluginConfig := range plugins {
+		// Skip plugins which are manually downloaded but defined declaratively.
+		if pluginConfig.Image == "" {
+			continue
+		}
+
 		pluginLogger := d.logger.With("plugin", pluginConfig.Slug())
 		configErr := pluginConfig.Validate("")
 
@@ -71,11 +80,6 @@ func (d *PluginDownloader) ReconcilePlugins(ctx context.Context) error {
 				pluginLogger.Warn("plugin config not valid")
 				continue
 			}
-		}
-
-		// Skip plugins which are manually downloaded but defined declaratively.
-		if pluginConfig.Image == "" {
-			continue
 		}
 
 		pluginLogger.Debug("processing plugin", "url", pluginConfig.URL(), "binary_name", pluginConfig.BinaryName)
@@ -173,6 +177,10 @@ func (d *PluginDownloader) IsPluginCacheValid(config *server.PluginConfig) bool 
 
 // DownloadPlugin downloads a plugin from an OCI registry
 func (d *PluginDownloader) DownloadPlugin(ctx context.Context, config *server.PluginConfig, logger hclog.Logger) error {
+	if d.pluginDirectory == "" {
+		return errors.New("plugin directory is not configured")
+	}
+
 	logger.Info("downloading plugin from OCI registry",
 		"url", config.URL())
 

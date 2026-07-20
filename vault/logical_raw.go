@@ -12,40 +12,75 @@ import (
 	"strings"
 
 	log "github.com/hashicorp/go-hclog"
+	"github.com/openbao/openbao/helper/namespace"
 	"github.com/openbao/openbao/sdk/v2/framework"
 	"github.com/openbao/openbao/sdk/v2/helper/compressutil"
 	"github.com/openbao/openbao/sdk/v2/logical"
+	"github.com/openbao/openbao/vault/barrier"
 )
 
 // protectedPaths cannot be accessed via the raw APIs.
 // This is both for security and to prevent disrupting Vault.
 var protectedPaths = []string{
-	keyringPath,
+	barrier.KeyringPath,
 	// Changing the cluster info path can change the cluster ID which can be disruptive
 	coreLocalClusterInfoPath,
 }
 
 type RawBackend struct {
 	*framework.Backend
-	barrier      SecurityBarrier
-	logger       log.Logger
-	checkRaw     func(path string) error
-	recoveryMode bool
+	core   *Core
+	logger log.Logger
 }
 
 func NewRawBackend(core *Core) *RawBackend {
 	r := &RawBackend{
-		barrier: core.barrier,
-		logger:  core.logger.Named("raw"),
-		checkRaw: func(path string) error {
-			return nil
-		},
-		recoveryMode: core.recoveryMode,
+		core:   core,
+		logger: core.logger.Named("raw"),
 	}
+
 	r.Backend = &framework.Backend{
-		Paths: rawPaths("sys/", r),
+		Paths: r.rawPaths("sys/"),
 	}
 	return r
+}
+
+// storageByPath returns appriopriate StorageAccess wrapping over specific
+// namespace barrier depending on the requested path. Also returns if the
+// namespace with given path (uuid) doesn't exist.
+func (b *RawBackend) storageByPath(ctx context.Context, path string) (StorageAccess, bool, error) {
+	ns, rest, err := b.core.NamespaceByStoragePath(ctx, path)
+	if err != nil {
+		return nil, false, err
+	}
+
+	// check if we are trying to access protected path.
+	for _, p := range protectedPaths {
+		if strings.HasPrefix(rest, p) {
+			return nil, false, fmt.Errorf("cannot access %q", rest)
+		}
+	}
+
+	// These paths use the "upper" barrier, which is the direct physical layer
+	// for the root namespace.
+	specialPath := rest == barrierSealConfigPath || rest == recoverySealConfigPath
+
+	// Fast-path root or deleted namespaces; we do not need a lookup into the
+	// seal manager.
+	if ns == nil || ns.ID == namespace.RootNamespaceID {
+		if specialPath {
+			return &directStorageAccess{physical: b.core.physical}, ns != nil, nil
+		} else {
+			return &secureStorageAccess{barrier: b.core.barrier}, ns != nil, nil
+		}
+	}
+
+	if specialPath {
+		parent, _ := ns.ParentPath()
+		return &secureStorageAccess{barrier: b.core.sealManager.NamespaceBarrierByLongestPrefix(parent)}, ns != nil, nil
+	} else {
+		return &secureStorageAccess{barrier: b.core.sealManager.NamespaceBarrierByLongestPrefix(ns.Path)}, ns != nil, nil
+	}
 }
 
 // handleRawRead is used to read directly from the barrier
@@ -63,40 +98,42 @@ func (b *RawBackend) handleRawRead(ctx context.Context, req *logical.Request, da
 		return logical.ErrorResponse("invalid encoding %q", encoding), logical.ErrInvalidRequest
 	}
 
-	if b.recoveryMode {
+	if b.core.recoveryMode {
 		b.logger.Info("reading", "path", path)
 	}
 
-	// Prevent access of protected paths
-	for _, p := range protectedPaths {
-		if strings.HasPrefix(path, p) {
-			err := fmt.Sprintf("cannot read %q", path)
-			return logical.ErrorResponse(err), logical.ErrInvalidRequest
-		}
-	}
-
-	entry, err := b.barrier.Get(ctx, path)
+	storage, _, err := b.storageByPath(ctx, path)
 	if err != nil {
 		return handleErrorNoReadOnlyForward(err)
 	}
-	if entry == nil {
+
+	valueBytes, err := storage.Get(ctx, path)
+	switch {
+	// We match against an error coming from using wrong barrier to read;
+	// This happens when we are in a storage space of a namespace that
+	// has been discarded from memory due to sealing of its parent.
+	case err != nil && strings.HasSuffix(err.Error(), "cipher: message authentication failed"):
+		return nil, barrier.ErrNamespaceSealed
+	case err != nil:
+		return handleErrorNoReadOnlyForward(err)
+	case valueBytes == nil:
 		return nil, nil
 	}
 
-	valueBytes := entry.Value
 	if compressed {
 		// Run this through the decompression helper to see if it's been compressed.
-		// If the input contained the compression canary, `valueBytes` will hold
-		// the decompressed data. If the input was not compressed, then `valueBytes`
+		// If the input contained the compression canary, `decompData` will hold
+		// the decompressed data. If the input was not compressed, then `decompData`
 		// will be nil.
-		valueBytes, _, err = compressutil.Decompress(entry.Value)
+		decompData, _, err := compressutil.Decompress(valueBytes)
 		if err != nil {
 			return handleErrorNoReadOnlyForward(err)
 		}
 
-		// `valueBytes` is nil if the input is uncompressed. In that case set it to the original input.
-		if valueBytes == nil {
-			valueBytes = entry.Value
+		// `decompData` is nil if the input is uncompressed.
+		// In that case set it to the original input.
+		if decompData != nil {
+			valueBytes = decompData
 		}
 	}
 
@@ -106,12 +143,11 @@ func (b *RawBackend) handleRawRead(ctx context.Context, req *logical.Request, da
 		value = valueBytes
 	}
 
-	resp := &logical.Response{
+	return &logical.Response{
 		Data: map[string]interface{}{
 			"value": value,
 		},
-	}
-	return resp, nil
+	}, nil
 }
 
 // handleRawWrite is used to write directly to the barrier
@@ -128,16 +164,8 @@ func (b *RawBackend) handleRawWrite(ctx context.Context, req *logical.Request, d
 		return logical.ErrorResponse("invalid encoding %q", encoding), logical.ErrInvalidRequest
 	}
 
-	if b.recoveryMode {
+	if b.core.recoveryMode {
 		b.logger.Info("writing", "path", path)
-	}
-
-	// Prevent access of protected paths
-	for _, p := range protectedPaths {
-		if strings.HasPrefix(path, p) {
-			err := fmt.Sprintf("cannot write %q", path)
-			return logical.ErrorResponse(err), logical.ErrInvalidRequest
-		}
 	}
 
 	v := data.Get("value").(string)
@@ -150,19 +178,29 @@ func (b *RawBackend) handleRawWrite(ctx context.Context, req *logical.Request, d
 		}
 	}
 
+	storage, allowWrites, err := b.storageByPath(ctx, path)
+	if err != nil {
+		return handleErrorNoReadOnlyForward(err)
+	}
+
+	if !allowWrites {
+		return nil, barrier.ErrNamespaceSealed
+	}
+
 	if req.Operation == logical.UpdateOperation {
-		// Check if this is an existing value with compression applied, if so, use the same compression (or no compression)
-		entry, err := b.barrier.Get(ctx, path)
+		// Check if this is an existing value with compression applied.
+		// If so, use the same compression (or no compression)
+		valueBytes, err := storage.Get(ctx, path)
 		if err != nil {
 			return handleErrorNoReadOnlyForward(err)
 		}
-		if entry == nil {
+		if valueBytes == nil {
 			err := "cannot figure out compression type because entry does not exist"
 			return logical.ErrorResponse(err), logical.ErrInvalidRequest
 		}
 
 		// For cases where DecompressWithCanary errored, treat entry as non-compressed data.
-		_, existingCompressionType, _, _ := compressutil.DecompressWithCanary(entry.Value)
+		_, existingCompressionType, _, _ := compressutil.DecompressWithCanary(valueBytes)
 
 		// Ensure compression_type matches existing entries' compression
 		// except allow writing non-compressed data over compressed data
@@ -200,12 +238,7 @@ func (b *RawBackend) handleRawWrite(ctx context.Context, req *logical.Request, d
 		}
 	}
 
-	entry := &logical.StorageEntry{
-		Key:   path,
-		Value: value,
-	}
-
-	if err := b.barrier.Put(ctx, entry); err != nil {
+	if err := storage.Put(ctx, path, value); err != nil {
 		return logical.ErrorResponse(err.Error()), logical.ErrInvalidRequest
 	}
 	return nil, nil
@@ -215,19 +248,16 @@ func (b *RawBackend) handleRawWrite(ctx context.Context, req *logical.Request, d
 func (b *RawBackend) handleRawDelete(ctx context.Context, req *logical.Request, data *framework.FieldData) (*logical.Response, error) {
 	path := data.Get("path").(string)
 
-	if b.recoveryMode {
+	if b.core.recoveryMode {
 		b.logger.Info("deleting", "path", path)
 	}
 
-	// Prevent access of protected paths
-	for _, p := range protectedPaths {
-		if strings.HasPrefix(path, p) {
-			err := fmt.Sprintf("cannot delete %q", path)
-			return logical.ErrorResponse(err), logical.ErrInvalidRequest
-		}
+	barrier, _, err := b.storageByPath(ctx, path)
+	if err != nil {
+		return handleErrorNoReadOnlyForward(err)
 	}
 
-	if err := b.barrier.Delete(ctx, path); err != nil {
+	if err := barrier.Delete(ctx, path); err != nil {
 		return handleErrorNoReadOnlyForward(err)
 	}
 	return nil, nil
@@ -246,19 +276,16 @@ func (b *RawBackend) handleRawList(ctx context.Context, req *logical.Request, da
 		path = path + "/"
 	}
 
-	if b.recoveryMode {
+	if b.core.recoveryMode {
 		b.logger.Info("listing", "path", path)
 	}
 
-	// Prevent access of protected paths
-	for _, p := range protectedPaths {
-		if strings.HasPrefix(path, p) {
-			err := fmt.Sprintf("cannot list %q", path)
-			return logical.ErrorResponse(err), logical.ErrInvalidRequest
-		}
+	barrier, _, err := b.storageByPath(ctx, path)
+	if err != nil {
+		return handleErrorNoReadOnlyForward(err)
 	}
 
-	keys, err := b.barrier.ListPage(ctx, path, after, limit)
+	keys, err := barrier.ListPage(ctx, path, after, limit)
 	if err != nil {
 		return handleErrorNoReadOnlyForward(err)
 	}
@@ -268,14 +295,24 @@ func (b *RawBackend) handleRawList(ctx context.Context, req *logical.Request, da
 // existenceCheck checks if entry exists, used in handleRawWrite for update or create operations
 func (b *RawBackend) existenceCheck(ctx context.Context, request *logical.Request, data *framework.FieldData) (bool, error) {
 	path := data.Get("path").(string)
-	entry, err := b.barrier.Get(ctx, path)
+
+	storage, allowWrites, err := b.storageByPath(ctx, path)
+	if err != nil {
+		return false, err
+	}
+
+	if !allowWrites {
+		return false, barrier.ErrNamespaceSealed
+	}
+
+	entry, err := storage.Get(ctx, path)
 	if err != nil {
 		return false, err
 	}
 	return entry != nil, nil
 }
 
-func rawPaths(prefix string, r *RawBackend) []*framework.Path {
+func (b *RawBackend) rawPaths(prefix string) []*framework.Path {
 	return []*framework.Path{
 		{
 			Pattern: prefix + "(raw/?$|raw/(?P<path>.+))",
@@ -308,7 +345,7 @@ func rawPaths(prefix string, r *RawBackend) []*framework.Path {
 
 			Operations: map[logical.Operation]framework.OperationHandler{
 				logical.ReadOperation: &framework.PathOperation{
-					Callback: r.handleRawRead,
+					Callback: b.handleRawRead,
 					DisplayAttrs: &framework.DisplayAttributes{
 						OperationPrefix: "raw",
 						OperationVerb:   "read",
@@ -328,7 +365,7 @@ func rawPaths(prefix string, r *RawBackend) []*framework.Path {
 					Summary: "Read the value of the key at the given path.",
 				},
 				logical.UpdateOperation: &framework.PathOperation{
-					Callback: r.handleRawWrite,
+					Callback: b.handleRawWrite,
 					DisplayAttrs: &framework.DisplayAttributes{
 						OperationPrefix: "raw",
 						OperationVerb:   "write",
@@ -342,7 +379,7 @@ func rawPaths(prefix string, r *RawBackend) []*framework.Path {
 					Summary: "Update the value of the key at the given path.",
 				},
 				logical.CreateOperation: &framework.PathOperation{
-					Callback: r.handleRawWrite,
+					Callback: b.handleRawWrite,
 					DisplayAttrs: &framework.DisplayAttributes{
 						OperationPrefix: "raw",
 						OperationVerb:   "write",
@@ -356,7 +393,7 @@ func rawPaths(prefix string, r *RawBackend) []*framework.Path {
 					Summary: "Create a key with value at the given path.",
 				},
 				logical.DeleteOperation: &framework.PathOperation{
-					Callback: r.handleRawDelete,
+					Callback: b.handleRawDelete,
 					DisplayAttrs: &framework.DisplayAttributes{
 						OperationPrefix: "raw",
 						OperationVerb:   "delete",
@@ -370,7 +407,7 @@ func rawPaths(prefix string, r *RawBackend) []*framework.Path {
 					Summary: "Delete the key with given path.",
 				},
 				logical.ListOperation: &framework.PathOperation{
-					Callback: r.handleRawList,
+					Callback: b.handleRawList,
 					DisplayAttrs: &framework.DisplayAttributes{
 						OperationPrefix: "raw",
 						OperationVerb:   "list",
@@ -391,7 +428,7 @@ func rawPaths(prefix string, r *RawBackend) []*framework.Path {
 				},
 			},
 
-			ExistenceCheck:  r.existenceCheck,
+			ExistenceCheck:  b.existenceCheck,
 			HelpSynopsis:    strings.TrimSpace(sysHelp["raw"][0]),
 			HelpDescription: strings.TrimSpace(sysHelp["raw"][1]),
 		},

@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"net/http"
 	"net/url"
 	"slices"
@@ -29,7 +30,7 @@ const (
 const (
 	// OIDC error prefixes. These are searched for specifically by the UI, so any
 	// changes to them must be aligned with a UI change.
-	errLoginFailed       = "Vault login failed."
+	errLoginFailed       = "OpenBao login failed."
 	errNoResponse        = "No response from provider."
 	errTokenVerification = "Token verification failed."
 	errNotOIDCFlow       = "OIDC login is not configured for this mount"
@@ -316,7 +317,8 @@ func (b *jwtAuthBackend) pathCallback(ctx context.Context, req *logical.Request,
 	oidcError := strings.ToLower(strings.TrimSpace(d.Get("error").(string)))
 	if oidcError != "" {
 		// strconv.Quote - for log-safe string output.
-		b.Logger().Warn("OIDC callback received error from provider",
+		b.Logger().Warn(
+			"OIDC callback received error from provider",
 			"error", strconv.Quote(oidcError),
 			"error_description", strconv.Quote(d.Get("error_description").(string)),
 			"error_uri", strconv.Quote(d.Get("error_uri").(string)),
@@ -484,9 +486,7 @@ func (b *jwtAuthBackend) processToken(ctx context.Context, req *logical.Request,
 	}
 
 	tokenMetadata := make(map[string]string)
-	for k, v := range alias.Metadata {
-		tokenMetadata[k] = v
-	}
+	maps.Copy(tokenMetadata, alias.Metadata)
 	for k, v := range oauth2Metadata {
 		tokenMetadata["oauth2_"+k] = v
 	}

@@ -24,6 +24,7 @@ import (
 	"fmt"
 	"hash"
 	"io"
+	"maps"
 	"math/big"
 	"path"
 	"strconv"
@@ -363,7 +364,7 @@ type Policy struct {
 	// Stores whether it's been deleted. This acts as a guard for operations
 	// that may write data, e.g. if one request rotates and that request is
 	// served after a delete.
-	deleted uint32
+	deleted atomic.Bool
 
 	Name    string      `json:"name"`
 	Key     []byte      `json:"key,omitempty"`      // DEPRECATED
@@ -596,7 +597,7 @@ func (p *Policy) handleArchiving(ctx context.Context, storage logical.Storage) e
 }
 
 func (p *Policy) Persist(ctx context.Context, storage logical.Storage) (retErr error) {
-	if atomic.LoadUint32(&p.deleted) == 1 {
+	if p.deleted.Load() {
 		return errors.New("key has been deleted, not persisting")
 	}
 
@@ -610,9 +611,7 @@ func (p *Policy) Persist(ctx context.Context, storage logical.Storage) (retErr e
 
 	if p.Keys != nil {
 		priorKeys = keyEntryMap{}
-		for k, v := range p.Keys {
-			priorKeys[k] = v
-		}
+		maps.Copy(priorKeys, p.Keys)
 	}
 
 	defer func() {
@@ -694,9 +693,7 @@ func (p *Policy) Upgrade(ctx context.Context, storage logical.Storage, randReade
 
 	if p.Keys != nil {
 		priorKeys = keyEntryMap{}
-		for k, v := range p.Keys {
-			priorKeys[k] = v
-		}
+		maps.Copy(priorKeys, p.Keys)
 	}
 
 	defer func() {
@@ -1642,9 +1639,7 @@ func (p *Policy) Rotate(ctx context.Context, storage logical.Storage, randReader
 
 	if p.Keys != nil {
 		priorKeys = keyEntryMap{}
-		for k, v := range p.Keys {
-			priorKeys[k] = v
-		}
+		maps.Copy(priorKeys, p.Keys)
 	}
 
 	defer func() {

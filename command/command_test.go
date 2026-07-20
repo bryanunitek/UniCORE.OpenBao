@@ -22,13 +22,14 @@ import (
 	"github.com/openbao/openbao/builtin/logical/transit"
 	"github.com/openbao/openbao/helper/benchhelpers"
 	"github.com/openbao/openbao/helper/builtinplugins"
-	"github.com/openbao/openbao/internalshared/configutil"
+	"github.com/openbao/openbao/helper/configutil"
 	"github.com/openbao/openbao/sdk/v2/helper/logging"
 	"github.com/openbao/openbao/sdk/v2/helper/pointerutil"
 	"github.com/openbao/openbao/sdk/v2/logical"
 	"github.com/openbao/openbao/sdk/v2/physical/inmem"
 	"github.com/openbao/openbao/vault"
 	"github.com/openbao/openbao/vault/seal"
+	"github.com/stretchr/testify/require"
 
 	auditFile "github.com/openbao/openbao/builtin/audit/file"
 	credUserpass "github.com/openbao/openbao/builtin/credential/userpass"
@@ -361,7 +362,7 @@ func testVaultServerBad(tb testing.TB) (*api.Client, func()) {
 	}
 
 	return client, func() {
-		ctx, done := context.WithTimeout(context.Background(), 5*time.Second)
+		ctx, done := context.WithTimeout(tb.Context(), 5*time.Second)
 		defer done()
 
 		server.Shutdown(ctx)
@@ -384,4 +385,45 @@ func testTokenAndAccessor(tb testing.TB, client *api.Client) (string, string) {
 		tb.Fatalf("missing auth data: %#v", secret)
 	}
 	return secret.Auth.ClientToken, secret.Auth.Accessor
+}
+
+// testVaultServerWithNamespace creates a test vault cluster (with an existing namespace
+// sealed or unsealed depending on the sealed flag provided to the function) and returns
+// a configured API client (with namespace header set), unseal keyshares and closer function.
+func testVaultServerWithNamespace(tb testing.TB, name string, sealed bool) (*api.Client, []string, func()) {
+	tb.Helper()
+
+	client, _, closer := testVaultServerUnseal(tb)
+	data := map[string]any{
+		"seal": `
+seal "shamir" {
+	shares = 3
+	threshold = 2
+}
+`,
+	}
+	resp, err := client.Logical().Write("/sys/namespaces/"+name, data)
+	require.NoError(tb, err)
+	keys, ok := resp.Data["key_shares"].([]any)
+	require.True(tb, ok)
+	keyShares := make([]string, 0, len(keys))
+	for _, share := range keys {
+		keyShares = append(keyShares, share.(string))
+	}
+	if sealed {
+		return client, keyShares, closer
+	}
+
+	for _, keyShare := range keyShares {
+		status, err := client.Sys().UnsealNamespace(&api.UnsealNamespaceInput{
+			Path: name,
+			Key:  keyShare,
+		})
+		require.NoError(tb, err)
+		if !status.Sealed {
+			break
+		}
+	}
+
+	return client, keyShares, closer
 }

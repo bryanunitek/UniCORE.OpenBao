@@ -5,12 +5,13 @@ package token
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"os"
-	"path/filepath"
 	"strings"
 
+	"github.com/openbao/openbao/api/v2"
 	"github.com/openbao/openbao/helper/homedir"
 )
 
@@ -20,21 +21,17 @@ var _ TokenHelper = (*InternalTokenHelper)(nil)
 // token-helper is configured, and avoids shelling out
 type InternalTokenHelper struct {
 	tokenPath string
-	homeDir   string
 }
 
 func NewInternalTokenHelper() (*InternalTokenHelper, error) {
-	homeDir, err := homedir.Dir()
-	if err != nil {
-		return nil, fmt.Errorf("error getting user's home directory: %w", err)
+	if tokenPath := api.ReadBaoVariable(api.EnvTokenPath); tokenPath != "" {
+		return &InternalTokenHelper{tokenPath: tokenPath}, nil
 	}
-	return &InternalTokenHelper{homeDir: homeDir}, err
-}
-
-// populateTokenPath figures out the token path using homedir to get the user's
-// home directory
-func (i *InternalTokenHelper) populateTokenPath() {
-	i.tokenPath = filepath.Join(i.homeDir, ".vault-token")
+	tokenPath, err := homedir.Expand("~/.vault-token")
+	if err != nil {
+		return nil, fmt.Errorf("could not expand home directory: %w", err)
+	}
+	return &InternalTokenHelper{tokenPath: tokenPath}, err
 }
 
 func (i *InternalTokenHelper) Path() string {
@@ -42,8 +39,7 @@ func (i *InternalTokenHelper) Path() string {
 }
 
 // Get gets the value of the stored token, if any
-func (i *InternalTokenHelper) Get() (string, error) {
-	i.populateTokenPath()
+func (i *InternalTokenHelper) Get() (value string, err error) {
 	f, err := os.Open(i.tokenPath)
 	if os.IsNotExist(err) {
 		return "", nil
@@ -51,7 +47,9 @@ func (i *InternalTokenHelper) Get() (string, error) {
 	if err != nil {
 		return "", err
 	}
-	defer f.Close()
+	defer func() {
+		err = errors.Join(err, f.Close())
+	}()
 
 	buf := bytes.NewBuffer(nil)
 	if _, err := io.Copy(buf, f); err != nil {
@@ -65,18 +63,16 @@ func (i *InternalTokenHelper) Get() (string, error) {
 // existing file atomically to ensure that ownership and permissions are set
 // appropriately.
 func (i *InternalTokenHelper) Store(input string) error {
-	i.populateTokenPath()
 	tmpFile := i.tokenPath + ".tmp"
 	f, err := os.OpenFile(tmpFile, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
 	if err != nil {
 		return err
 	}
-	defer f.Close()
-	defer os.Remove(tmpFile)
+	defer os.Remove(tmpFile) //nolint:errcheck // tmp file will have been moved if successful
 
 	_, err = io.WriteString(f, input)
 	if err != nil {
-		return err
+		return errors.Join(err, f.Close())
 	}
 	err = f.Close()
 	if err != nil {
@@ -92,7 +88,6 @@ func (i *InternalTokenHelper) Store(input string) error {
 
 // Erase erases the value of the token
 func (i *InternalTokenHelper) Erase() error {
-	i.populateTokenPath()
 	if err := os.Remove(i.tokenPath); err != nil && !os.IsNotExist(err) {
 		return err
 	}

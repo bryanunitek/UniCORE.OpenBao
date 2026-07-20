@@ -6,11 +6,13 @@ package http
 import (
 	"bytes"
 	"context"
+	"crypto/x509"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"io/fs"
+	"maps"
 	"mime"
 	"net"
 	"net/http"
@@ -28,9 +30,9 @@ import (
 	"github.com/hashicorp/go-sockaddr"
 	"github.com/hashicorp/go-uuid"
 	gziphandler "github.com/klauspost/compress/gzhttp"
+	"github.com/openbao/openbao/helper/configutil"
+	"github.com/openbao/openbao/helper/listenerutil"
 	"github.com/openbao/openbao/helper/namespace"
-	"github.com/openbao/openbao/internalshared/configutil"
-	"github.com/openbao/openbao/internalshared/listenerutil"
 	"github.com/openbao/openbao/sdk/v2/helper/consts"
 	"github.com/openbao/openbao/sdk/v2/helper/jsonutil"
 	"github.com/openbao/openbao/sdk/v2/helper/pathmanager"
@@ -39,35 +41,21 @@ import (
 )
 
 const (
-	// WrapTTLHeaderName is the name of the header containing a directive to
-	// wrap the response
-	WrapTTLHeaderName = "X-Vault-Wrap-TTL"
-
-	// WrapFormatHeaderName is the name of the header containing the format to
-	// wrap in; has no effect if the wrap TTL is not set
-	WrapFormatHeaderName = "X-Vault-Wrap-Format"
-
-	// NoRequestForwardingHeaderName is the name of the header telling Vault
-	// not to use request forwarding
-	NoRequestForwardingHeaderName = "X-Vault-No-Request-Forwarding"
-
-	// MFAHeaderName represents the HTTP header which carries the credentials
-	// required to perform MFA on any path.
-	MFAHeaderName = "X-Vault-MFA"
-
-	// canonicalMFAHeaderName is the MFA header value's format in the request
-	// headers. Do not alter the casing of this string.
-	canonicalMFAHeaderName = "X-Vault-Mfa"
-
-	// PolicyOverrideHeaderName is the header set to request overriding
-	// soft-mandatory Sentinel policies.
-	PolicyOverrideHeaderName = "X-Vault-Policy-Override"
-
 	// DefaultMaxRequestSize is the default maximum accepted request size. This
 	// is to prevent a denial of service attack where no Content-Length is
 	// provided and the server is fed ever more data until it exhausts memory.
 	// Can be overridden per listener.
 	DefaultMaxRequestSize = 32 * 1024 * 1024
+
+	// ProcessedForwardedClientCertHeader is an internal-only header used for
+	// passing the leaf certificate to the logical layer from the http handler
+	// layer, when forwarded by a client.
+	ProcessedForwardedClientCertHeader = "X-Processed-Tls-Client-Certificate"
+
+	// RFC 9440 standardizes proposed headers for use with proxies. We trim
+	// these to avoid a confusion attack.
+	RFC9440ClientCertHeader  = "Client-Cert"
+	RFC9440ClientChainHeader = "Client-Chain"
 )
 
 var (
@@ -255,7 +243,8 @@ func handler(props *vault.HandlerProperties) http.Handler {
 
 	// Wrap the handler in another handler to trigger all help paths.
 	helpWrappedHandler := wrapHelpHandler(mux, core)
-	corsWrappedHandler := wrapCORSHandler(helpWrappedHandler, core)
+	clientCertHandler := wrapClientCertificateHandler(helpWrappedHandler, props)
+	corsWrappedHandler := wrapCORSHandler(clientCertHandler, core)
 	quotaWrappedHandler := rateLimitQuotaWrapping(corsWrappedHandler, core)
 	genericWrappedHandler := genericWrapping(core, quotaWrappedHandler, props)
 	metricsWrappedHandler := wrapMetricsListenerHandler(genericWrappedHandler, props)
@@ -385,7 +374,7 @@ func wrapGenericHandler(core *vault.Core, h http.Handler, props *vault.HandlerPr
 		} else {
 			ctx, cancelFunc = context.WithTimeout(ctx, maxRequestDuration)
 		}
-		ctx = context.WithValue(ctx, "original_request_path", r.URL.Path)
+		ctx = vault.ContextWithOriginalRequestPath(ctx, r.URL.Path)
 
 		nsHeader := r.Header.Get(consts.NamespaceHeaderName)
 		if nsHeader != "" {
@@ -404,12 +393,12 @@ func wrapGenericHandler(core *vault.Core, h http.Handler, props *vault.HandlerPr
 		if core.RaftNodeIDHeaderEnabled() {
 			nodeID := core.GetRaftNodeID()
 			if nodeID != "" {
-				nw.Header().Set("X-Vault-Raft-Node-ID", nodeID)
+				nw.Header().Set(consts.RaftNodeIDHeaderName, nodeID)
 			}
 		}
 
 		if core.HostnameHeaderEnabled() && hostname != "" {
-			nw.Header().Set("X-Vault-Hostname", hostname)
+			nw.Header().Set(consts.HostnameHeaderName, hostname)
 		}
 
 		isRestrictedSysAPI := nsHeader != "" && strings.HasPrefix(r.URL.Path, "/v1/sys/") &&
@@ -472,7 +461,8 @@ func wrapGenericHandler(core *vault.Core, h http.Handler, props *vault.HandlerPr
 				ReqPath:          r.URL.Path,
 				ClientRemoteAddr: clientAddr,
 				Method:           requestMethod,
-			})
+			},
+		)
 		defer func() {
 			// Not expecting this fail, so skipping the assertion check
 			core.FinalizeInFlightReqData(inFlightReqID, nw.StatusCode)
@@ -484,15 +474,39 @@ func wrapGenericHandler(core *vault.Core, h http.Handler, props *vault.HandlerPr
 	})
 }
 
-func WrapForwardedForHandler(h http.Handler, l *configutil.Listener) http.Handler {
+func WrapHttpServerHandler(h http.Handler, l *configutil.Listener) http.Handler {
+	if l == nil {
+		return h
+	}
+
+	if len(l.XForwardedForAuthorizedAddrs) > 0 {
+		h = wrapForwardedForHandler(h, l)
+	}
+
+	return h
+}
+
+func wrapForwardedForHandler(h http.Handler, l *configutil.Listener) http.Handler {
 	rejectNotPresent := l.XForwardedForRejectNotPresent
 	hopSkips := l.XForwardedForHopSkips
 	authorizedAddrs := l.XForwardedForAuthorizedAddrs
 	rejectNotAuthz := l.XForwardedForRejectNotAuthorized
+	keepUnauthorizedCertHeaders := l.XForwardedForClientCertKeepUnauthorized
+	keepNotForwardedCertHeaders := l.XForwardedForClientCertKeepNotForwarded
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		headers, headersOK := r.Header[textproto.CanonicalMIMEHeaderKey("X-Forwarded-For")]
 		if !headersOK || len(headers) == 0 {
 			if !rejectNotPresent {
+				if !keepNotForwardedCertHeaders {
+					// This request is not from a forwarding system, so we should
+					// remove any forwarded leaf certificate headers. Even Unix
+					// sockets should attach this information for us.
+					if len(l.XForwardedForClientCertHeader) > 0 {
+						r.Header.Del(l.XForwardedForClientCertHeader)
+					}
+					r.Header.Del(RFC9440ClientCertHeader)
+					r.Header.Del(RFC9440ClientChainHeader)
+				}
 				h.ServeHTTP(w, r)
 				return
 			}
@@ -538,7 +552,17 @@ func WrapForwardedForHandler(h http.Handler, l *configutil.Listener) http.Handle
 				// We need to delete the X-Forwarded-For header before
 				// passing it along, otherwise downstream systems will not
 				// know whether or not to trust it.
+				//
+				// This is true of the forwarded certificate headers as well.
 				r.Header.Del(textproto.CanonicalMIMEHeaderKey("X-Forwarded-For"))
+
+				if !keepUnauthorizedCertHeaders {
+					if len(l.XForwardedForClientCertHeader) > 0 {
+						r.Header.Del(l.XForwardedForClientCertHeader)
+					}
+					r.Header.Del(RFC9440ClientCertHeader)
+					r.Header.Del(RFC9440ClientChainHeader)
+				}
 
 				// Now serve the request, having rejected the header.
 				h.ServeHTTP(w, r)
@@ -555,8 +579,8 @@ func WrapForwardedForHandler(h http.Handler, l *configutil.Listener) http.Handle
 		// to the multiple-header case.
 		var acc []string
 		for _, header := range headers {
-			vals := strings.Split(header, ",")
-			for _, v := range vals {
+			vals := strings.SplitSeq(header, ",")
+			for v := range vals {
 				acc = append(acc, strings.TrimSpace(v))
 			}
 		}
@@ -578,6 +602,111 @@ func WrapForwardedForHandler(h http.Handler, l *configutil.Listener) http.Handle
 		}
 
 		r.RemoteAddr = net.JoinHostPort(acc[indexToUse], port)
+		h.ServeHTTP(w, r)
+	})
+}
+
+func wrapClientCertificateHandler(h http.Handler, props *vault.HandlerProperties) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Strip any X-Processed-Tls-Client-Certificate headers before
+		// processing.
+		r.Header.Del(ProcessedForwardedClientCertHeader)
+
+		var clientCertificateHeaderName string
+		var decoders []string
+		if props != nil && props.ListenerConfig != nil {
+			clientCertificateHeaderName = props.ListenerConfig.XForwardedForClientCertHeader
+			decoders = props.ListenerConfig.XForwardedForClientCertDecoders
+		}
+
+		if len(clientCertificateHeaderName) == 0 {
+			// Nothing to do; listener configuration does not set the
+			// x_forwarded_for_client_cert_header option so we should
+			// continue on.
+			//
+			// Remove the standardized client cert headers for safety,
+			// even though we don't explicitly process them; they'd be
+			// untrusted.
+			r.Header.Del(RFC9440ClientCertHeader)
+			r.Header.Del(RFC9440ClientChainHeader)
+
+			h.ServeHTTP(w, r)
+			return
+		}
+
+		// Short circuit if no client cert header value.
+		clientCertHeaderValues := r.Header.Values(clientCertificateHeaderName)
+		if len(clientCertHeaderValues) == 0 || len(clientCertHeaderValues[0]) == 0 {
+			h.ServeHTTP(w, r)
+			return
+		}
+
+		// Do not handle multiple certs. If there are multiple certificates,
+		// throw an error for non-compliant behavior.
+		//
+		// This is out of scope and if a proxy is following RFC 9440, the chain
+		// excluding the end entity would be a separate header.
+		//
+		// For now, we ignore the chain and assume the cert auth operator can
+		// configure their auth mount with additional intermediates if
+		// required.
+		if len(clientCertHeaderValues) > 1 {
+			respondError(w, http.StatusBadRequest, errors.New("too many values for client certificate header; check RFC 9440 and do not send chain"))
+			return
+		}
+
+		// Different servers have different ways of encoding the certificate.
+		headerValue := clientCertHeaderValues[0]
+		for _, decoder := range decoders {
+			var err error
+
+			// This list must be kept in sync with the listener
+			// configuration parser.
+			switch decoder {
+			case "RFC9440":
+				headerValue, err = rfc9440DecodeHeader(headerValue)
+			case "URL":
+				headerValue, err = urlDecodeHeader(headerValue)
+			case "PEM":
+				headerValue, err = pemDecodeHeader(headerValue)
+			default:
+				respondError(w, http.StatusInternalServerError, errors.New("bad server configuration for forwarded certificate parsing; unknown parser"))
+				return
+			}
+
+			if err != nil {
+				respondError(w, http.StatusBadRequest, err)
+				return
+			}
+		}
+
+		// Validate that the processed cert is valid StdEncoding base64
+		certDer, err := base64.StdEncoding.DecodeString(headerValue)
+		if err != nil {
+			respondError(w, http.StatusBadRequest, errors.New("error decoding client certificate header as base64"))
+			return
+		}
+
+		// Validate that the processed certificate is a valid certificate.
+		_, err = x509.ParseCertificate(certDer)
+		if err != nil {
+			respondError(w, http.StatusBadRequest, errors.New("error decoding client certificate header as x509.Certificate"))
+			return
+		}
+
+		// Add the client cert header.
+		r.Header.Add(ProcessedForwardedClientCertHeader, headerValue)
+
+		// Delete the unprocessed header.
+		r.Header.Del(clientCertificateHeaderName)
+
+		// Remove the standardized client cert headers for safety,
+		// even though we don't explicitly process them; they'd be
+		// untrusted.
+		r.Header.Del(RFC9440ClientCertHeader)
+		r.Header.Del(RFC9440ClientChainHeader)
+
+		// Call our next handler.
 		h.ServeHTTP(w, r)
 	})
 }
@@ -726,33 +855,6 @@ func parseQuery(values url.Values) map[string]interface{} {
 	return nil
 }
 
-func parseJSONRequest(r *http.Request, w http.ResponseWriter, out interface{}) error {
-	ctx := r.Context()
-
-	// Enforce limits on JSON complexity.
-	_, _, err := EnforceJSONComplexityLimits(ctx, r.Body)
-	if err != nil {
-		return fmt.Errorf("failed to limit JSON input: %w", err)
-	}
-
-	// Reset to the beginning.
-	if err := resetBody(r); err != nil {
-		return fmt.Errorf("failed to reset body: %w", err)
-	}
-
-	err = jsonutil.DecodeJSONFromReader(r.Body, out)
-	if err != nil && err != io.EOF {
-		return fmt.Errorf("failed to parse JSON input: %w", err)
-	}
-
-	// Reset to the beginning again.
-	if err := resetBody(r); err != nil {
-		return fmt.Errorf("failed to reset body: %w", err)
-	}
-
-	return err
-}
-
 // parseFormRequest parses values from a form POST.
 //
 // A nil map will be returned if the format is empty or invalid.
@@ -804,7 +906,7 @@ func forwardRequest(core *vault.Core, w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if r.Header.Get(NoRequestForwardingHeaderName) != "" {
+	if r.Header.Get(consts.NoRequestForwardingHeaderName) != "" {
 		// Forwarding explicitly disabled, fall back to previous behavior
 		core.Logger().Debug("forwardRequest: forwarding disabled by client request")
 		respondStandby(core, w, r.URL)
@@ -832,9 +934,7 @@ func forwardRequest(core *vault.Core, w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	for k, v := range header {
-		w.Header()[k] = v
-	}
+	maps.Copy(w.Header(), header)
 
 	w.WriteHeader(statusCode)
 	w.Write(retBytes)
@@ -976,25 +1076,10 @@ func requestAuth(r *http.Request, req *logical.Request) {
 	}
 }
 
-func requestPolicyOverride(r *http.Request, req *logical.Request) error {
-	raw := r.Header.Get(PolicyOverrideHeaderName)
-	if raw == "" {
-		return nil
-	}
-
-	override, err := parseutil.ParseBool(raw)
-	if err != nil {
-		return err
-	}
-
-	req.PolicyOverride = override
-	return nil
-}
-
 // requestWrapInfo adds the WrapInfo value to the logical.Request if wrap info exists
 func requestWrapInfo(r *http.Request, req *logical.Request) (*logical.Request, error) {
 	// First try for the header value
-	wrapTTL := r.Header.Get(WrapTTLHeaderName)
+	wrapTTL := r.Header.Get(consts.WrapTTLHeaderName)
 	if wrapTTL == "" {
 		return req, nil
 	}
@@ -1012,59 +1097,13 @@ func requestWrapInfo(r *http.Request, req *logical.Request) (*logical.Request, e
 		TTL: dur,
 	}
 
-	wrapFormat := r.Header.Get(WrapFormatHeaderName)
+	wrapFormat := r.Header.Get(consts.WrapFormatHeaderName)
 	switch wrapFormat {
 	case "jwt":
 		req.WrapInfo.Format = "jwt"
 	}
 
 	return req, nil
-}
-
-// parseMFAHeader parses the MFAHeaderName in the request headers and organizes
-// them with MFA method name as the index.
-func parseMFAHeader(req *logical.Request) error {
-	if req == nil {
-		return errors.New("request is nil")
-	}
-
-	if req.Headers == nil {
-		return nil
-	}
-
-	// Reset and initialize the credentials in the request
-	req.MFACreds = make(map[string][]string)
-
-	for _, mfaHeaderValue := range req.Headers[canonicalMFAHeaderName] {
-		// Skip the header with no value in it
-		if mfaHeaderValue == "" {
-			continue
-		}
-
-		// Handle the case where only method name is mentioned and no value
-		// is supplied
-		if !strings.Contains(mfaHeaderValue, ":") {
-			// Mark the presence of method name, but set an empty set to it
-			// indicating that there were no values supplied for the method
-			if req.MFACreds[mfaHeaderValue] == nil {
-				req.MFACreds[mfaHeaderValue] = []string{}
-			}
-			continue
-		}
-
-		shardSplits := strings.SplitN(mfaHeaderValue, ":", 2)
-		if shardSplits[0] == "" {
-			return fmt.Errorf("invalid data in header %q; missing method name or ID", MFAHeaderName)
-		}
-
-		if shardSplits[1] == "" {
-			return fmt.Errorf("invalid data in header %q; missing method value", MFAHeaderName)
-		}
-
-		req.MFACreds[shardSplits[0]] = append(req.MFACreds[shardSplits[0]], shardSplits[1])
-	}
-
-	return nil
 }
 
 // isForm tries to determine whether the request should be

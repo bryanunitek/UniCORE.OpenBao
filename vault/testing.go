@@ -18,6 +18,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"math/big"
 	mathrand "math/rand"
 	"net"
@@ -26,7 +27,6 @@ import (
 	"path/filepath"
 	"reflect"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/hashicorp/go-cleanhttp"
@@ -41,11 +41,11 @@ import (
 	auditFile "github.com/openbao/openbao/builtin/audit/file"
 	"github.com/openbao/openbao/builtin/logical/kv"
 	"github.com/openbao/openbao/command/server"
+	"github.com/openbao/openbao/helper/configutil"
 	"github.com/openbao/openbao/helper/metricsutil"
 	"github.com/openbao/openbao/helper/namespace"
 	"github.com/openbao/openbao/helper/testhelpers/corehelpers"
 	"github.com/openbao/openbao/helper/testhelpers/pluginhelpers"
-	"github.com/openbao/openbao/internalshared/configutil"
 	v5 "github.com/openbao/openbao/sdk/v2/database/dbplugin/v5"
 	"github.com/openbao/openbao/sdk/v2/framework"
 	"github.com/openbao/openbao/sdk/v2/helper/consts"
@@ -56,9 +56,11 @@ import (
 	"github.com/openbao/openbao/sdk/v2/physical"
 	physInmem "github.com/openbao/openbao/sdk/v2/physical/inmem"
 	backendplugin "github.com/openbao/openbao/sdk/v2/plugin"
+	be "github.com/openbao/openbao/vault/backend"
+	"github.com/openbao/openbao/vault/barrier"
 	"github.com/openbao/openbao/vault/cluster"
+	"github.com/openbao/openbao/vault/routing"
 	"github.com/stretchr/testify/require"
-	"golang.org/x/crypto/ed25519"
 	"golang.org/x/net/http2"
 )
 
@@ -197,7 +199,6 @@ func TestCoreWithSealAndUINoCleanup(t testing.T, opts *CoreConfig) *Core {
 	conf.DisableSSCTokens = opts.DisableSSCTokens
 	conf.PluginDirectory = opts.PluginDirectory
 	conf.DetectDeadlocks = opts.DetectDeadlocks
-	conf.AdministrativeNamespacePath = opts.AdministrativeNamespacePath
 	conf.ImpreciseLeaseRoleTracking = opts.ImpreciseLeaseRoleTracking
 	conf.UnsafeCrossNamespaceIdentity = opts.UnsafeCrossNamespaceIdentity
 	conf.UnsafeRelativePaths = opts.UnsafeRelativePaths
@@ -210,24 +211,16 @@ func TestCoreWithSealAndUINoCleanup(t testing.T, opts *CoreConfig) *Core {
 		conf.RedirectAddr = opts.RedirectAddr
 	}
 
-	for k, v := range opts.LogicalBackends {
-		conf.LogicalBackends[k] = v
-	}
-	for k, v := range opts.CredentialBackends {
-		conf.CredentialBackends[k] = v
-	}
+	maps.Copy(conf.LogicalBackends, opts.LogicalBackends)
+	maps.Copy(conf.CredentialBackends, opts.CredentialBackends)
 
-	for k, v := range opts.AuditBackends {
-		conf.AuditBackends[k] = v
-	}
+	maps.Copy(conf.AuditBackends, opts.AuditBackends)
 	if opts.RollbackPeriod != time.Duration(0) {
 		conf.RollbackPeriod = opts.RollbackPeriod
 	}
 	if opts.NumRollbackWorkers != 0 {
 		conf.NumRollbackWorkers = opts.NumRollbackWorkers
 	}
-
-	testApplyEntBaseConfig(conf, opts)
 
 	c, err := NewCore(conf)
 	if err != nil {
@@ -246,7 +239,9 @@ func testCoreConfig(t testing.T, physicalBackend physical.Backend, logger log.Lo
 	noopBackends := make(map[string]logical.Factory)
 	noopBackends["noop"] = func(ctx context.Context, config *logical.BackendConfig) (logical.Backend, error) {
 		b := new(framework.Backend)
-		b.Setup(ctx, config)
+		if err := b.Setup(ctx, config); err != nil {
+			return nil, err
+		}
 		b.BackendType = logical.TypeCredential
 		return b, nil
 	}
@@ -255,22 +250,14 @@ func testCoreConfig(t testing.T, physicalBackend physical.Backend, logger log.Lo
 	}
 
 	credentialBackends := make(map[string]logical.Factory)
-	for backendName, backendFactory := range noopBackends {
-		credentialBackends[backendName] = backendFactory
-	}
-	for backendName, backendFactory := range testCredentialBackends {
-		credentialBackends[backendName] = backendFactory
-	}
+	maps.Copy(credentialBackends, noopBackends)
+	maps.Copy(credentialBackends, be.TestCredentialBackends)
 
 	logicalBackends := make(map[string]logical.Factory)
-	for backendName, backendFactory := range noopBackends {
-		logicalBackends[backendName] = backendFactory
-	}
+	maps.Copy(logicalBackends, noopBackends)
 
 	logicalBackends["kv"] = LeasedPassthroughBackendFactory
-	for backendName, backendFactory := range testLogicalBackends {
-		logicalBackends[backendName] = backendFactory
-	}
+	maps.Copy(logicalBackends, be.TestLogicalBackends)
 
 	conf := &CoreConfig{
 		Physical:           physicalBackend,
@@ -302,8 +289,6 @@ func TestCoreInitClusterWrapperSetup(t testing.T, core *Core, handler http.Handl
 		SecretThreshold: 3,
 	}
 
-	barrierConfig.StoredShares = 1
-
 	recoveryConfig := &SealConfig{
 		SecretShares:    3,
 		SecretThreshold: 3,
@@ -313,7 +298,7 @@ func TestCoreInitClusterWrapperSetup(t testing.T, core *Core, handler http.Handl
 		BarrierConfig:  barrierConfig,
 		RecoveryConfig: recoveryConfig,
 	}
-	result, err := core.Initialize(context.Background(), initParams)
+	result, err := core.Initialize(namespace.RootContext(context.Background()), initParams)
 	if err != nil {
 		t.Fatalf("err: %s", err)
 	}
@@ -332,6 +317,22 @@ func TestCoreSeal(core *Core) error {
 	return core.sealInternal()
 }
 
+func TestNamespaceUnseal(core *Core, ns *namespace.Namespace, key []byte) (bool, error) {
+	ctx := namespace.RootContext(context.Background())
+
+	parentPath, _ := ns.ParentPath()
+	parent, err := core.namespaceStore.GetNamespaceByPath(ctx, parentPath)
+	if err != nil {
+		return false, err
+	}
+
+	return core.namespaceStore.UnsealNamespace(
+		namespace.ContextWithNamespace(ctx, parent),
+		parent.TrimmedPath(ns.Path),
+		TestKeyCopy(key),
+	)
+}
+
 func TestCoreCreateNamespaces(t testing.T, core *Core, namespaces ...*namespace.Namespace) {
 	t.Helper()
 	ctx := namespace.RootContext(context.Background())
@@ -343,6 +344,49 @@ func TestCoreCreateNamespaces(t testing.T, core *Core, namespaces ...*namespace.
 		err = core.namespaceStore.SetNamespace(parentCtx, ns)
 		require.NoError(t, err)
 	}
+}
+
+// TestCoreCreateSealedNamespaces creates sealed namespaces with 3 key shares and
+// returns the key shares for each namespace in a map with namespace path as key.
+func TestCoreCreateSealedNamespaces(t testing.T, core *Core, namespaces ...*namespace.Namespace) map[string][][]byte {
+	t.Helper()
+	sealConfig := &SealConfig{
+		Type:            "shamir",
+		SecretShares:    3,
+		SecretThreshold: 3,
+	}
+	ctx := namespace.RootContext(context.Background())
+	keysPerNamespace := make(map[string][][]byte)
+	for _, ns := range namespaces {
+		parentPath, _ := ns.ParentPath()
+		parent, err := core.namespaceStore.GetNamespaceByPath(ctx, parentPath)
+		require.NoError(t, err)
+
+		nsSealKeyShares, err := core.namespaceStore.SetNamespaceWithSeal(namespace.ContextWithNamespace(ctx, parent), ns, sealConfig)
+		require.NoError(t, err)
+		keysPerNamespace[ns.Path] = nsSealKeyShares
+	}
+	return keysPerNamespace
+}
+
+// TestCoreCreateUnsealedNamespaces creates sealed namespaces with 3 key shares.
+// unseals the namespaces and returns back the key shares for each namespace
+// in a map with namespace path as key.
+func TestCoreCreateUnsealedNamespaces(t testing.T, core *Core, namespaces ...*namespace.Namespace) map[string][][]byte {
+	t.Helper()
+	keyShares := TestCoreCreateSealedNamespaces(t, core, namespaces...)
+	for _, ns := range namespaces {
+		for _, key := range keyShares[ns.Path] {
+			unsealed, err := TestNamespaceUnseal(core, ns, key)
+			require.NoError(t, err)
+			if unsealed {
+				break
+			}
+		}
+
+		require.False(t, core.NamespaceSealed(ns))
+	}
+	return keyShares
 }
 
 // TestCoreUnsealed returns a pure in-memory core that is already
@@ -432,7 +476,7 @@ func testCoreAddSecretMountContext(ctx context.Context, t testing.T, core *Core,
 }
 
 func testCoreAddSecretMount(t testing.T, core *Core, token string) {
-	rootCtx := namespace.RootContext(nil)
+	rootCtx := namespace.RootContext(context.TODO())
 	testCoreAddSecretMountContext(rootCtx, t, core, "secret/", token)
 }
 
@@ -485,7 +529,7 @@ func TestCoreUpgradeToKVv2(t testing.T, core *Core, token string) {
 		Operation:   logical.DeleteOperation,
 	}
 
-	resp, err := core.HandleRequest(namespace.RootContext(nil), req)
+	resp, err := core.HandleRequest(namespace.RootContext(context.TODO()), req)
 	require.NoError(t, err)
 	require.False(t, resp.IsError())
 
@@ -498,7 +542,7 @@ func TestCoreUpgradeToKVv2(t testing.T, core *Core, token string) {
 		"type": "kv-v2",
 	}
 
-	resp, err = core.HandleRequest(namespace.RootContext(nil), req)
+	resp, err = core.HandleRequest(namespace.RootContext(context.TODO()), req)
 	require.NoError(t, err)
 	require.False(t, resp.IsError())
 }
@@ -512,18 +556,18 @@ func TestKeyCopy(key []byte) []byte {
 }
 
 func TestDynamicSystemView(c *Core, ns *namespace.Namespace) *dynamicSystemView {
-	me := &MountEntry{
-		Config: MountConfig{
+	me := &routing.MountEntry{
+		Config: routing.MountConfig{
 			DefaultLeaseTTL: 24 * time.Hour,
 			MaxLeaseTTL:     2 * 24 * time.Hour,
 		},
 		NamespaceID: namespace.RootNamespace.ID,
-		namespace:   namespace.RootNamespace,
+		Namespace:   namespace.RootNamespace,
 	}
 
 	if ns != nil {
 		me.NamespaceID = ns.ID
-		me.namespace = ns
+		me.Namespace = ns
 	}
 
 	return &dynamicSystemView{c, me}
@@ -653,28 +697,6 @@ func TestPluginClientConfig(c *Core, pluginType consts.PluginType, pluginName st
 	return pluginutil.PluginClientConfig{}
 }
 
-var (
-	testLogicalBackends    = map[string]logical.Factory{}
-	testCredentialBackends = map[string]logical.Factory{}
-)
-
-// This adds a credential backend for the test core. This needs to be
-// invoked before the test core is created.
-func AddTestCredentialBackend(name string, factory logical.Factory) error {
-	if name == "" {
-		return errors.New("missing backend name")
-	}
-	if factory == nil {
-		return errors.New("missing backend factory function")
-	}
-	testCredentialBackends[name] = factory
-	return nil
-}
-
-func ClearTestCredentialBackends() {
-	testCredentialBackends = map[string]logical.Factory{}
-}
-
 // This adds a logical backend for the test core. This needs to be
 // invoked before the test core is created.
 func AddTestLogicalBackend(name string, factory logical.Factory) error {
@@ -684,7 +706,7 @@ func AddTestLogicalBackend(name string, factory logical.Factory) error {
 	if factory == nil {
 		return errors.New("missing backend factory function")
 	}
-	testLogicalBackends[name] = factory
+	be.TestLogicalBackends[name] = factory
 	return nil
 }
 
@@ -816,11 +838,9 @@ type TestCluster struct {
 	CleanupFunc        func()
 	SetupFunc          func()
 
-	cleanupFuncs      []func()
-	base              *CoreConfig
-	LicensePublicKey  ed25519.PublicKey
-	LicensePrivateKey ed25519.PrivateKey
-	opts              *TestClusterOptions
+	cleanupFuncs []func()
+	base         *CoreConfig
+	opts         *TestClusterOptions
 }
 
 func (c *TestCluster) SetRootToken(token string) {
@@ -853,7 +873,7 @@ func (c *TestCluster) start(t testing.T) {
 
 	activeCore := -1
 WAITACTIVE:
-	for i := 0; i < 60; i++ {
+	for range 60 {
 		for i, core := range c.Cores {
 			if standby := core.Standby(); !standby {
 				activeCore = i
@@ -1004,10 +1024,6 @@ func (c *TestClusterCore) stop() error {
 		}
 		c.Logger().Info("listeners successfully shut down")
 	}
-	if c.licensingStopCh != nil {
-		close(c.licensingStopCh)
-		c.licensingStopCh = nil
-	}
 
 	if err := c.Shutdown(); err != nil {
 		return err
@@ -1078,7 +1094,10 @@ func (c *TestCluster) Cleanup() {
 
 	// Remove any temp dir that exists
 	if c.TempDir != "" {
-		os.RemoveAll(c.TempDir)
+		err := os.RemoveAll(c.TempDir)
+		if err != nil {
+			c.Logger.Error("error deleting temp dir", "error", err)
+		}
 	}
 
 	// Give time to actually shut down/clean up before the next test
@@ -1107,10 +1126,6 @@ func (c *TestCluster) ensureCoresSealed() error {
 	return nil
 }
 
-func SetReplicationFailureMode(core *TestClusterCore, mode uint32) {
-	atomic.StoreUint32(core.replicationFailure, mode)
-}
-
 type TestListener struct {
 	net.Listener
 	Address *net.TCPAddr
@@ -1132,10 +1147,9 @@ type TestClusterCore struct {
 	ServerKey            *ecdsa.PrivateKey
 	ServerKeyPEM         []byte
 	tlsConfig            *tls.Config
-	UnderlyingStorage    physical.Backend
 	UnderlyingRawStorage physical.Backend
 	UnderlyingHAStorage  physical.HABackend
-	Barrier              SecurityBarrier
+	Barrier              barrier.SecurityBarrier
 	NodeID               string
 }
 
@@ -1216,8 +1230,6 @@ type TestClusterOptions struct {
 	CoreMetricSinkProvider func(clusterName string) (*metricsutil.ClusterMetricSink, *metricsutil.MetricsHelper)
 
 	PhysicalFactoryConfig map[string]interface{}
-	LicensePublicKey      ed25519.PublicKey
-	LicensePrivateKey     ed25519.PrivateKey
 
 	// this stores the vault version that should be used for each core config
 	VersionMap             map[int]string
@@ -1537,11 +1549,9 @@ func NewTestCluster(t testing.T, base *CoreConfig, opts *TestClusterOptions) *Te
 		coreConfig.DisablePerformanceStandby = base.DisablePerformanceStandby
 		coreConfig.MetricsHelper = base.MetricsHelper
 		coreConfig.MetricSink = base.MetricSink
-		coreConfig.SecureRandomReader = base.SecureRandomReader
 		coreConfig.DisableSentinelTrace = base.DisableSentinelTrace
 		coreConfig.ClusterName = base.ClusterName
 		coreConfig.DisableAutopilot = base.DisableAutopilot
-		coreConfig.AdministrativeNamespacePath = base.AdministrativeNamespacePath
 		coreConfig.ServiceRegistration = base.ServiceRegistration
 		coreConfig.ImpreciseLeaseRoleTracking = base.ImpreciseLeaseRoleTracking
 
@@ -1567,19 +1577,13 @@ func NewTestCluster(t testing.T, base *CoreConfig, opts *TestClusterOptions) *Te
 		}
 
 		if base.LogicalBackends != nil {
-			for k, v := range base.LogicalBackends {
-				coreConfig.LogicalBackends[k] = v
-			}
+			maps.Copy(coreConfig.LogicalBackends, base.LogicalBackends)
 		}
 		if base.CredentialBackends != nil {
-			for k, v := range base.CredentialBackends {
-				coreConfig.CredentialBackends[k] = v
-			}
+			maps.Copy(coreConfig.CredentialBackends, base.CredentialBackends)
 		}
 		if base.AuditBackends != nil {
-			for k, v := range base.AuditBackends {
-				coreConfig.AuditBackends[k] = v
-			}
+			maps.Copy(coreConfig.AuditBackends, base.AuditBackends)
 		}
 		if base.Logger != nil {
 			coreConfig.Logger = base.Logger
@@ -1595,7 +1599,6 @@ func NewTestCluster(t testing.T, base *CoreConfig, opts *TestClusterOptions) *Te
 		coreConfig.PendingRemovalMountsAllowed = base.PendingRemovalMountsAllowed
 		coreConfig.ExpirationRevokeRetryBase = base.ExpirationRevokeRetryBase
 		coreConfig.UnsafeCrossNamespaceIdentity = base.UnsafeCrossNamespaceIdentity
-		testApplyEntBaseConfig(coreConfig, base)
 	}
 	if coreConfig.ClusterName == "" {
 		coreConfig.ClusterName = t.Name()
@@ -1639,15 +1642,6 @@ func NewTestCluster(t testing.T, base *CoreConfig, opts *TestClusterOptions) *Te
 		coreConfig.HAPhysical = haPhys.(physical.HABackend)
 	}
 
-	if testCluster.LicensePublicKey == nil {
-		pubKey, priKey, err := GenerateTestLicenseKeys()
-		if err != nil {
-			t.Fatalf("err: %v", err)
-		}
-		testCluster.LicensePublicKey = pubKey
-		testCluster.LicensePrivateKey = priKey
-	}
-
 	if opts != nil && opts.InmemClusterLayers {
 		if opts.ClusterLayers != nil {
 			t.Fatal("cannot specify ClusterLayers when InmemClusterLayers is true")
@@ -1682,7 +1676,7 @@ func NewTestCluster(t testing.T, base *CoreConfig, opts *TestClusterOptions) *Te
 	coreConfigs := []*CoreConfig{}
 
 	for i := 0; i < numCores; i++ {
-		cleanup, c, localConfig, handler := testCluster.newCore(t, i, coreConfig, opts, listeners[i], testCluster.LicensePublicKey)
+		cleanup, c, localConfig, handler := testCluster.newCore(t, i, coreConfig, opts, listeners[i])
 
 		testCluster.cleanupFuncs = append(testCluster.cleanupFuncs, cleanup)
 		cores = append(cores, c)
@@ -1726,8 +1720,6 @@ func NewTestCluster(t testing.T, base *CoreConfig, opts *TestClusterOptions) *Te
 		(*tcc.ReloadFuncs)["listener|tcp"] = []reloadutil.ReloadFunc{certGetters[i].Reload}
 		tcc.ReloadFuncsLock.Unlock()
 
-		testAdjustUnderlyingStorage(tcc)
-
 		ret = append(ret, tcc)
 	}
 	testCluster.Cores = ret
@@ -1740,11 +1732,6 @@ func NewTestCluster(t testing.T, base *CoreConfig, opts *TestClusterOptions) *Te
 	// Assign clients
 	for i := 0; i < numCores; i++ {
 		testCluster.Cores[i].Client = testCluster.getAPIClient(t, opts, listeners[i][0].Address.Port, tlsConfigs[i])
-	}
-
-	// Extra Setup
-	for _, tcc := range testCluster.Cores {
-		testExtraTestCoreSetup(t, testCluster.LicensePrivateKey, tcc)
 	}
 
 	// Cleanup
@@ -1844,7 +1831,7 @@ func (cluster *TestCluster) StartCore(t testing.T, idx int, opts *TestClusterOpt
 	}
 
 	// Create a new Core
-	cleanup, newCore, localConfig, coreHandler := cluster.newCore(t, idx, tcc.CoreConfig, opts, tcc.Listeners, cluster.LicensePublicKey)
+	cleanup, newCore, localConfig, coreHandler := cluster.newCore(t, idx, tcc.CoreConfig, opts, tcc.Listeners)
 	if coreHandler != nil {
 		tcc.Handler = coreHandler
 		tcc.Server.Handler = coreHandler
@@ -1857,12 +1844,10 @@ func (cluster *TestCluster) StartCore(t testing.T, idx int, opts *TestClusterOpt
 
 	cluster.setupClusterListener(
 		t, idx, newCore, tcc.CoreConfig,
-		opts, tcc.Listeners, tcc.Handler)
+		opts, tcc.Listeners, tcc.Handler,
+	)
 
 	tcc.Client = cluster.getAPIClient(t, opts, tcc.Listeners[0].Address.Port, tcc.tlsConfig)
-
-	testAdjustUnderlyingStorage(tcc)
-	testExtraTestCoreSetup(t, cluster.LicensePrivateKey, tcc)
 
 	// Start listeners
 	for _, ln := range tcc.Listeners {
@@ -1873,7 +1858,7 @@ func (cluster *TestCluster) StartCore(t testing.T, idx int, opts *TestClusterOpt
 	tcc.Logger().Info("restarted test core", "core", idx)
 }
 
-func (testCluster *TestCluster) newCore(t testing.T, idx int, coreConfig *CoreConfig, opts *TestClusterOptions, listeners []*TestListener, pubKey ed25519.PublicKey) (func(), *Core, CoreConfig, http.Handler) {
+func (testCluster *TestCluster) newCore(t testing.T, idx int, coreConfig *CoreConfig, opts *TestClusterOptions, listeners []*TestListener) (func(), *Core, CoreConfig, http.Handler) {
 	localConfig := *coreConfig
 	cleanupFunc := func() {}
 	var handler http.Handler

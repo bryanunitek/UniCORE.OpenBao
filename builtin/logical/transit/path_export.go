@@ -286,7 +286,8 @@ func getExportKey(policy *keysutil.Policy, key *keysutil.KeyEntry, exportType st
 				&pem.Block{
 					Type:  "CERTIFICATE",
 					Bytes: derCertificateBytes,
-				})))
+				},
+			)))
 			pemCertificates = append(pemCertificates, pemCert)
 		}
 		certificateChain := strings.Join(pemCertificates, "\n")

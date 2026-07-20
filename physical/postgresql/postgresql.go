@@ -13,7 +13,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/cenkalti/backoff/v4"
+	"github.com/cenkalti/backoff/v5"
 	log "github.com/hashicorp/go-hclog"
 	metrics "github.com/hashicorp/go-metrics/compat"
 	"github.com/hashicorp/go-secure-stdlib/parseutil"
@@ -124,9 +124,7 @@ func NewPostgreSQLBackend(conf map[string]string, logger log.Logger) (physical.B
 		if err != nil {
 			return nil, fmt.Errorf("failed parsing max_parallel parameter: %w", err)
 		}
-		if logger.IsDebug() {
-			logger.Debug("max_parallel set", "max_parallel", maxParInt)
-		}
+		logger.Debug("max_parallel set", "max_parallel", maxParInt)
 	} else {
 		maxParInt = physical.DefaultParallelOperations
 	}
@@ -138,9 +136,7 @@ func NewPostgreSQLBackend(conf map[string]string, logger log.Logger) (physical.B
 		if err != nil {
 			return nil, fmt.Errorf("failed parsing transaction_max_parallel parameter: %w", err)
 		}
-		if logger.IsDebug() {
-			logger.Debug("transaction_max_parallel set", "transaction_max_parallel", txnMaxParInt)
-		}
+		logger.Debug("transaction_max_parallel set", "transaction_max_parallel", txnMaxParInt)
 	} else {
 		txnMaxParInt = physical.DefaultParallelTransactions
 	}
@@ -152,9 +148,7 @@ func NewPostgreSQLBackend(conf map[string]string, logger log.Logger) (physical.B
 		if err != nil {
 			return nil, fmt.Errorf("failed parsing max_idle_connections parameter: %w", err)
 		}
-		if logger.IsDebug() {
-			logger.Debug("max_idle_connections set", "max_idle_connections", maxIdleConnsStr)
-		}
+		logger.Debug("max_idle_connections set", "max_idle_connections", maxIdleConnsStr)
 	}
 
 	// Set maximum retries for DB connection liveness check on startup.
@@ -165,15 +159,13 @@ func NewPostgreSQLBackend(conf map[string]string, logger log.Logger) (physical.B
 		if err != nil {
 			return nil, fmt.Errorf("failed parsing max_connect_retries parameter: %w", err)
 		}
-		if logger.IsDebug() {
-			logger.Debug("max_connect_retries set", "max_connect_retries", maxRetriesInt)
-		}
+		logger.Debug("max_connect_retries set", "max_connect_retries", maxRetriesInt)
 	} else {
 		maxRetriesInt = 1
 	}
 
 	// Create PostgreSQL handle for the database.
-	db, err := doRetryConnect(logger, connURL, uint64(maxRetriesInt))
+	db, err := doRetryConnect(logger, connURL, uint(maxRetriesInt))
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to postgres: %w", err)
 	}
@@ -294,33 +286,26 @@ func connectionURL(conf map[string]string) string {
 	return connURL
 }
 
-func doRetryConnect(logger log.Logger, connURL string, retries uint64) (*sql.DB, error) {
+func doRetryConnect(logger log.Logger, connURL string, retries uint) (*sql.DB, error) {
 	db, err := sql.Open("pgx", connURL)
 	if err != nil {
 		return nil, err
 	}
 
-	var b backoff.BackOff = backoff.NewExponentialBackOff(
-		backoff.WithMaxInterval(5*time.Second),
-		backoff.WithInitialInterval(15*time.Millisecond),
-	)
-	if retries > 0 {
-		b = backoff.WithMaxRetries(b, retries)
+	b := backoff.NewExponentialBackOff()
+	b.MaxInterval = 5 * time.Second
+	b.InitialInterval = 15 * time.Millisecond
+
+	op := func() (none struct{}, err error) {
+		if err := db.Ping(); err != nil {
+			logger.Debug("database not ready", "err", err)
+			return none, err
+		}
+		return none, nil
 	}
 
-	b.Reset()
-
-	if err := backoff.Retry(func() error {
-		err := db.Ping()
-		if err != nil {
-			logger.Debug("database not ready", "err", err)
-			return err
-		}
-
-		return nil
-	}, b); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("unable to verify connection: %w", err)
+	if _, err := backoff.Retry(context.Background(), op, backoff.WithBackOff(b), backoff.WithMaxTries(retries)); err != nil {
+		return nil, errors.Join(fmt.Errorf("unable to verify connection: %w", err), db.Close())
 	}
 
 	return db, nil
@@ -334,7 +319,7 @@ func (m *PostgreSQLBackend) createTables() error {
 		return fmt.Errorf("failed to begin transaction: %w", err)
 	}
 
-	defer txn.Rollback()
+	defer txn.Rollback() //nolint:errcheck
 
 	createTableQuery := "CREATE TABLE IF NOT EXISTS " + m.table + " (" +
 		`parent_path TEXT COLLATE "C" NOT NULL,` +

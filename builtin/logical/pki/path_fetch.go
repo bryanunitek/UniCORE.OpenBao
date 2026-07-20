@@ -333,7 +333,7 @@ func (b *backend) pathFetchCertListDetailed(ctx context.Context, req *logical.Re
 			return nil, fmt.Errorf("failed to start read-only transaction: %w", err)
 		}
 
-		defer readOnlyTxn.Rollback(ctx) // Ensure rollback after the operation
+		defer readOnlyTxn.Rollback(ctx) //nolint:errcheck // Ensure rollback after the operation
 		req.Storage = readOnlyTxn
 	}
 
@@ -602,9 +602,7 @@ reply:
 			},
 		}
 		if retErr != nil {
-			if b.Logger().IsWarn() {
-				b.Logger().Warn("possible error, but cannot return in raw response. Note that an empty CA probably means none was configured, and an empty CRL is possibly correct", "error", retErr)
-			}
+			b.Logger().Warn("possible error, but cannot return in raw response. Note that an empty CA probably means none was configured, and an empty CRL is possibly correct", "error", retErr)
 		}
 		retErr = nil
 		if len(certificate) > 0 {

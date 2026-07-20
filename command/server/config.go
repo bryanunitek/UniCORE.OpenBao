@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"math"
 	"os"
 	"path/filepath"
@@ -23,9 +24,9 @@ import (
 	"github.com/hashicorp/hcl"
 	"github.com/hashicorp/hcl/hcl/ast"
 	"github.com/openbao/openbao/api/v2"
+	"github.com/openbao/openbao/helper/configutil"
 	"github.com/openbao/openbao/helper/osutil"
 	"github.com/openbao/openbao/helper/profiles"
-	"github.com/openbao/openbao/internalshared/configutil"
 	"github.com/openbao/openbao/sdk/v2/helper/consts"
 	"github.com/openbao/openbao/sdk/v2/helper/hclutil"
 	"github.com/openbao/openbao/sdk/v2/helper/testcluster"
@@ -39,10 +40,6 @@ const (
 	PluginDownloadFail     = "fail"
 	PluginDownloadContinue = "continue"
 )
-
-var entConfigValidate = func(_ *Config, _ string) []configutil.ConfigError {
-	return nil
-}
 
 // Config is the configuration for the vault server.
 type Config struct {
@@ -148,6 +145,12 @@ type Config struct {
 	// Whether read requests are disabled on standby nodes.
 	DisableStandbyReads bool `hcl:"disable_standby_reads"`
 
+	// Whether to allow unauthenticated workflows. While not inherently unsafe,
+	// as requests created by workflows still require authentication and a
+	// workflow author would have to embed a token, these still should be used
+	// with care.
+	AllowUnauthenticatedWorkflows bool `hcl:"allow_unauthenticated_workflows"`
+
 	// Whether to allow unsafe (usually URL encoded) relative request paths
 	// (containing `..`).
 	UnsafeRelativePaths bool `hcl:"unsafe_relative_paths"`
@@ -170,6 +173,9 @@ func (c *Config) Validate(sourceFilePath string) []configutil.ConfigError {
 	for _, p := range c.Plugins {
 		results = append(results, p.Validate(sourceFilePath)...)
 	}
+	for _, o := range c.Initialization {
+		results = append(results, o.ValidateUnused(sourceFilePath)...)
+	}
 
 	// Validate plugin_download_behavior
 	if c.PluginDownloadBehavior != "" {
@@ -180,12 +186,7 @@ func (c *Config) Validate(sourceFilePath string) []configutil.ConfigError {
 		}
 	}
 
-	results = append(results, c.validateEnt(sourceFilePath)...)
 	return results
-}
-
-func (c *Config) validateEnt(sourceFilePath string) []configutil.ConfigError {
-	return entConfigValidate(c, sourceFilePath)
 }
 
 // DevConfig is a Config that is used for dev mode of OpenBao.
@@ -361,7 +362,7 @@ func (p *PluginConfig) Validate(sourceFilePath string) []configutil.ConfigError 
 	}
 
 	// Validate Type is valid
-	_, err := consts.ParsePluginType(p.Type)
+	typ, err := consts.ParsePluginType(p.Type)
 	if err != nil {
 		results = append(results, configutil.ConfigError{
 			Problem: fmt.Sprintf("plugin %q: %s", p.Name, err.Error()),
@@ -379,18 +380,13 @@ func (p *PluginConfig) Validate(sourceFilePath string) []configutil.ConfigError 
 		})
 	}
 
-	// Validate Version is not empty
-	if p.Version == "" {
-		results = append(results, configutil.ConfigError{
-			Problem: fmt.Sprintf("plugin %q: version cannot be empty", p.Slug()),
-		})
-	}
-
-	// Ensure Image:Version is a valid image reference
-	if _, err := name.ParseReference(p.URL()); err != nil {
-		results = append(results, configutil.ConfigError{
-			Problem: fmt.Sprintf("plugin %q: image and version do not form a valid image reference. %v", p.Slug(), err),
-		})
+	if p.Image != "" {
+		// Ensure Image:Version is a valid image reference
+		if _, err := name.ParseReference(p.URL()); err != nil {
+			results = append(results, configutil.ConfigError{
+				Problem: fmt.Sprintf("plugin %q: image and version do not form a valid image reference. %v", p.Slug(), err),
+			})
+		}
 	}
 
 	// Validate binary_name is not empty
@@ -398,6 +394,17 @@ func (p *PluginConfig) Validate(sourceFilePath string) []configutil.ConfigError 
 		results = append(results, configutil.ConfigError{
 			Problem: fmt.Sprintf("plugin %q: binary_name cannot be empty when image specified", p.Slug()),
 		})
+	}
+
+	if typ != consts.PluginTypeKMS || p.Image != "" {
+		// Validate version is not empty. KMS plugins do not require or enforce
+		// that a version is set. OCI-based plugins however require a version be
+		// set at all times.
+		if p.Version == "" {
+			results = append(results, configutil.ConfigError{
+				Problem: fmt.Sprintf("plugin %q: version cannot be empty", p.Slug()),
+			})
+		}
 	}
 
 	// Validate sha256sum is exactly 64 hex characters
@@ -518,15 +525,9 @@ func (c *Config) Merge(c2 *Config) *Config {
 	}
 
 	// merge these integers via a MAX operation
-	result.MaxLeaseTTL = c.MaxLeaseTTL
-	if c2.MaxLeaseTTL > result.MaxLeaseTTL {
-		result.MaxLeaseTTL = c2.MaxLeaseTTL
-	}
+	result.MaxLeaseTTL = max(c2.MaxLeaseTTL, c.MaxLeaseTTL)
 
-	result.DefaultLeaseTTL = c.DefaultLeaseTTL
-	if c2.DefaultLeaseTTL > result.DefaultLeaseTTL {
-		result.DefaultLeaseTTL = c2.DefaultLeaseTTL
-	}
+	result.DefaultLeaseTTL = max(c2.DefaultLeaseTTL, c.DefaultLeaseTTL)
 
 	result.ClusterCipherSuites = c.ClusterCipherSuites
 	if c2.ClusterCipherSuites != "" {
@@ -662,11 +663,6 @@ func (c *Config) Merge(c2 *Config) *Config {
 		}
 	}
 
-	result.AdministrativeNamespacePath = c.AdministrativeNamespacePath
-	if c2.AdministrativeNamespacePath != "" {
-		result.AdministrativeNamespacePath = c2.AdministrativeNamespacePath
-	}
-
 	if len(c.Initialization) > 0 || len(c2.Initialization) > 0 {
 		result.Initialization = make([]*profiles.OuterConfig, len(c.Initialization)+len(c2.Initialization))
 		copy(result.Initialization[0:len(c.Initialization)], c.Initialization)
@@ -713,7 +709,7 @@ func (c *Config) Merge(c2 *Config) *Config {
 
 // LoadConfig loads the configuration at the given path, regardless if
 // its a file or directory.
-func LoadConfig(path string, allPaths []string) (*Config, error) {
+func LoadConfig(path string, allPaths []string) (cfg *Config, err error) {
 	fi, err := os.Stat(path)
 	if err != nil {
 		return nil, err
@@ -726,14 +722,16 @@ func LoadConfig(path string, allPaths []string) (*Config, error) {
 			var err error
 			enableFilePermissionsCheck, err = strconv.ParseBool(enableFilePermissionsCheckEnv)
 			if err != nil {
-				return nil, errors.New("error parsing the environment variable BAO_ENABLE_FILE_PERMISSIONS_CHECK")
+				return nil, fmt.Errorf("failed to parse environment variable %s", consts.VaultEnableFilePermissionsCheckEnv)
 			}
 		}
 		f, err := os.Open(path)
 		if err != nil {
 			return nil, err
 		}
-		defer f.Close()
+		defer func() {
+			err = errors.Join(err, f.Close())
+		}()
 
 		if enableFilePermissionsCheck {
 			err = osutil.OwnerPermissionsMatchFile(f, 0, 0)
@@ -764,7 +762,7 @@ func CheckConfig(c *Config, e error) (*Config, error) {
 }
 
 // LoadConfigFile loads the configuration from the given file.
-func LoadConfigFile(path string, allPaths []string) (*Config, error) {
+func LoadConfigFile(path string, allPaths []string) (cfg *Config, err error) {
 	// Before we read the configuration, check if we would've loaded it from
 	// a configuration directory at some point in time. If so, ignore the
 	// duplicate load.
@@ -780,7 +778,9 @@ func LoadConfigFile(path string, allPaths []string) (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer f.Close()
+	defer func() {
+		err = errors.Join(err, f.Close())
+	}()
 	// Read the file
 	d, err := io.ReadAll(f)
 	if err != nil {
@@ -797,7 +797,7 @@ func LoadConfigFile(path string, allPaths []string) (*Config, error) {
 		var err error
 		enableFilePermissionsCheck, err = strconv.ParseBool(enableFilePermissionsCheckEnv)
 		if err != nil {
-			return nil, errors.New("error parsing the environment variable BAO_ENABLE_FILE_PERMISSIONS_CHECK")
+			return nil, fmt.Errorf("failed to parse environment variable %s", consts.VaultEnableFilePermissionsCheckEnv)
 		}
 	}
 
@@ -809,7 +809,6 @@ func LoadConfigFile(path string, allPaths []string) (*Config, error) {
 		}
 		// check permissions of the plugin directory
 		if conf.PluginDirectory != "" {
-
 			err = osutil.OwnerPermissionsMatch(conf.PluginDirectory, conf.PluginFileUid, conf.PluginFilePermissions)
 			if err != nil {
 				return nil, err
@@ -1073,12 +1072,14 @@ func ParseConfig(d, source string) (*Config, error) {
 
 // LoadConfigDir loads all the configurations in the given directory
 // in alphabetical order.
-func LoadConfigDir(dir string) (*Config, error) {
+func LoadConfigDir(dir string) (cfg *Config, err error) {
 	f, err := os.Open(dir)
 	if err != nil {
 		return nil, err
 	}
-	defer f.Close()
+	defer func() {
+		err = errors.Join(err, f.Close())
+	}()
 
 	fi, err := f.Stat()
 	if err != nil {
@@ -1398,9 +1399,7 @@ func (c *Config) Sanitized() map[string]interface{} {
 		"unsafe_allow_api_audit_creation": c.UnsafeAllowAPIAuditCreation,
 		"allow_audit_log_prefixing":       c.AllowAuditLogPrefixing,
 	}
-	for k, v := range sharedResult {
-		result[k] = v
-	}
+	maps.Copy(result, sharedResult)
 
 	// Sanitize storage stanza
 	if c.Storage != nil {

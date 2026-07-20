@@ -4,7 +4,6 @@
 package kubeauth
 
 import (
-	"context"
 	"crypto"
 	"os"
 	"reflect"
@@ -106,7 +105,7 @@ func TestConfig_Read(t *testing.T) {
 				Data:      tc.data,
 			}
 
-			resp, err := b.HandleRequest(context.Background(), req)
+			resp, err := b.HandleRequest(t.Context(), req)
 			if err != nil || (resp != nil && resp.IsError()) {
 				t.Fatalf("got unexpected error %s for resp %#v", err, resp)
 			}
@@ -118,7 +117,7 @@ func TestConfig_Read(t *testing.T) {
 				Data:      nil,
 			}
 
-			resp, err = b.HandleRequest(context.Background(), req)
+			resp, err = b.HandleRequest(t.Context(), req)
 			if err != nil || (resp != nil && resp.IsError()) {
 				t.Fatalf("got unexpected error %s for resp %#v", err, resp)
 			}
@@ -148,7 +147,7 @@ func TestConfig(t *testing.T) {
 		Data:      data,
 	}
 
-	resp, err := b.HandleRequest(context.Background(), req)
+	resp, err := b.HandleRequest(t.Context(), req)
 	if err != nil || (resp != nil && resp.IsError()) {
 		t.Fatalf("err:%s resp:%#v\n", err, resp)
 	}
@@ -165,7 +164,7 @@ func TestConfig(t *testing.T) {
 		Data:      data,
 	}
 
-	resp, _ = b.HandleRequest(context.Background(), req)
+	resp, _ = b.HandleRequest(t.Context(), req)
 	if resp == nil || !resp.IsError() {
 		t.Fatal("expected error")
 	}
@@ -186,7 +185,7 @@ func TestConfig(t *testing.T) {
 		Data:      data,
 	}
 
-	resp, _ = b.HandleRequest(context.Background(), req)
+	resp, _ = b.HandleRequest(t.Context(), req)
 	if resp == nil || !resp.IsError() {
 		t.Fatal("expected error")
 	}
@@ -207,7 +206,7 @@ func TestConfig(t *testing.T) {
 		Data:      data,
 	}
 
-	resp, err = b.HandleRequest(context.Background(), req)
+	resp, err = b.HandleRequest(t.Context(), req)
 	if err != nil || (resp != nil && resp.IsError()) {
 		t.Fatalf("err:%s resp:%#v\n", err, resp)
 	}
@@ -220,7 +219,7 @@ func TestConfig(t *testing.T) {
 		DisableISSValidation: true,
 	}
 
-	conf, err := b.(*kubeAuthBackend).config(context.Background(), storage)
+	conf, err := b.(*kubeAuthBackend).config(t.Context(), storage)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -228,6 +227,8 @@ func TestConfig(t *testing.T) {
 	if !reflect.DeepEqual(expected, conf) {
 		t.Fatalf("expected did not match actual: expected %#v\n got %#v\n", expected, conf)
 	}
+
+	jwtGoodDataToken := jwtGoodDataToken()
 
 	// Test success TokenReviewer
 	data = map[string]interface{}{
@@ -243,7 +244,7 @@ func TestConfig(t *testing.T) {
 		Data:      data,
 	}
 
-	resp, err = b.HandleRequest(context.Background(), req)
+	resp, err = b.HandleRequest(t.Context(), req)
 	if err != nil || (resp != nil && resp.IsError()) {
 		t.Fatalf("err:%s resp:%#v\n", err, resp)
 	}
@@ -266,7 +267,7 @@ func TestConfig(t *testing.T) {
 		DisableLocalCAJwt:    false,
 	}
 
-	conf, err = b.(*kubeAuthBackend).config(context.Background(), storage)
+	conf, err = b.(*kubeAuthBackend).config(t.Context(), storage)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -289,7 +290,7 @@ func TestConfig(t *testing.T) {
 		Data:      data,
 	}
 
-	resp, err = b.HandleRequest(context.Background(), req)
+	resp, err = b.HandleRequest(t.Context(), req)
 	if err != nil || (resp != nil && resp.IsError()) {
 		t.Fatalf("err:%s resp:%#v\n", err, resp)
 	}
@@ -308,7 +309,7 @@ func TestConfig(t *testing.T) {
 		DisableLocalCAJwt:    false,
 	}
 
-	conf, err = b.(*kubeAuthBackend).config(context.Background(), storage)
+	conf, err = b.(*kubeAuthBackend).config(t.Context(), storage)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -331,7 +332,7 @@ func TestConfig(t *testing.T) {
 		Data:      data,
 	}
 
-	resp, err = b.HandleRequest(context.Background(), req)
+	resp, err = b.HandleRequest(t.Context(), req)
 	if err != nil || (resp != nil && resp.IsError()) {
 		t.Fatalf("err:%s resp:%#v\n", err, resp)
 	}
@@ -355,7 +356,7 @@ func TestConfig(t *testing.T) {
 		DisableLocalCAJwt:    false,
 	}
 
-	conf, err = b.(*kubeAuthBackend).config(context.Background(), storage)
+	conf, err = b.(*kubeAuthBackend).config(t.Context(), storage)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -378,7 +379,7 @@ func TestConfig(t *testing.T) {
 		Data:      data,
 	}
 
-	resp, err = b.HandleRequest(context.Background(), req)
+	resp, err = b.HandleRequest(t.Context(), req)
 	if err != nil || (resp != nil && resp.IsError()) {
 		t.Fatalf("err:%s resp:%#v\n", err, resp)
 	}
@@ -400,7 +401,7 @@ func TestConfig(t *testing.T) {
 		DisableLocalCAJwt:    false,
 	}
 
-	conf, err = b.(*kubeAuthBackend).config(context.Background(), storage)
+	conf, err = b.(*kubeAuthBackend).config(t.Context(), storage)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -411,6 +412,8 @@ func TestConfig(t *testing.T) {
 }
 
 func TestConfig_LocalCaJWT(t *testing.T) {
+	jwtGoodDataToken := jwtGoodDataToken()
+
 	testCases := map[string]struct {
 		config              map[string]interface{}
 		setupInClusterFiles bool
@@ -497,12 +500,12 @@ func TestConfig_LocalCaJWT(t *testing.T) {
 				Data:      tc.config,
 			}
 
-			resp, err := b.HandleRequest(context.Background(), req)
+			resp, err := b.HandleRequest(t.Context(), req)
 			if err != nil || (resp != nil && resp.IsError()) {
 				t.Fatalf("err:%s resp:%#v\n", err, resp)
 			}
 
-			conf, err := b.(*kubeAuthBackend).loadConfig(context.Background(), storage)
+			conf, err := b.(*kubeAuthBackend).loadConfig(t.Context(), storage)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -553,13 +556,13 @@ func TestConfig_LocalJWTRenewal(t *testing.T) {
 		Data:      data,
 	}
 
-	resp, err := b.HandleRequest(context.Background(), req)
+	resp, err := b.HandleRequest(t.Context(), req)
 	if err != nil || (resp != nil && resp.IsError()) {
 		t.Fatalf("err:%s resp:%#v\n", err, resp)
 	}
 
 	// Loading the config will load the initial token file from disk.
-	conf, err := b.(*kubeAuthBackend).loadConfig(context.Background(), storage)
+	conf, err := b.(*kubeAuthBackend).loadConfig(t.Context(), storage)
 	if err != nil || (resp != nil && resp.IsError()) {
 		t.Fatalf("err:%s resp:%#v\n", err, resp)
 	}
@@ -576,7 +579,7 @@ func TestConfig_LocalJWTRenewal(t *testing.T) {
 	}
 
 	// Load again to check we still got the old cached token from memory.
-	conf, err = b.(*kubeAuthBackend).loadConfig(context.Background(), storage)
+	conf, err = b.(*kubeAuthBackend).loadConfig(t.Context(), storage)
 	if err != nil || (resp != nil && resp.IsError()) {
 		t.Fatalf("err:%s resp:%#v\n", err, resp)
 	}
@@ -589,7 +592,7 @@ func TestConfig_LocalJWTRenewal(t *testing.T) {
 	currentTime = currentTime.Add(1 * time.Minute)
 
 	// Load again and check we the new renewed token from disk.
-	conf, err = b.(*kubeAuthBackend).loadConfig(context.Background(), storage)
+	conf, err = b.(*kubeAuthBackend).loadConfig(t.Context(), storage)
 	if err != nil || (resp != nil && resp.IsError()) {
 		t.Fatalf("err:%s resp:%#v\n", err, resp)
 	}

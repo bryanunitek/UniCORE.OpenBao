@@ -444,7 +444,8 @@ func (b *backend) formatKeyPolicy(p *keysutil.Policy, context []byte) (*logical.
 						&pem.Block{
 							Type:  "CERTIFICATE",
 							Bytes: derCertBytes,
-						})))
+						},
+					)))
 					pemCerts = append(pemCerts, pemCert)
 				}
 				key.CertificateChain = strings.Join(pemCerts, "\n")

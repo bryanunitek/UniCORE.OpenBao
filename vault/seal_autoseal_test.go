@@ -94,7 +94,7 @@ func TestAutoSeal_UpgradeKeys(t *testing.T) {
 	pBackend := newTestBackend(t)
 	core.physical = pBackend
 
-	ctx := context.Background()
+	ctx := t.Context()
 
 	inkeys := [][]byte{[]byte("grist"), []byte("house")}
 	if err := autoSeal.SetStoredKeys(ctx, inkeys); err != nil {
@@ -179,7 +179,8 @@ func TestAutoSeal_UpgradeKeys(t *testing.T) {
 func TestAutoSeal_HealthCheck(t *testing.T) {
 	inmemSink := metrics.NewInmemSink(
 		1000000*time.Hour,
-		2000000*time.Hour)
+		2000000*time.Hour,
+	)
 
 	metricsConf := metrics.DefaultConfig("")
 	metricsConf.EnableHostname = false

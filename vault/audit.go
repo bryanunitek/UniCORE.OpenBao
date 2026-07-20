@@ -19,6 +19,7 @@ import (
 	"github.com/openbao/openbao/sdk/v2/helper/jsonutil"
 	"github.com/openbao/openbao/sdk/v2/helper/salt"
 	"github.com/openbao/openbao/sdk/v2/logical"
+	"github.com/openbao/openbao/vault/routing"
 )
 
 const (
@@ -71,7 +72,7 @@ func (c *Core) generateAuditTestProbe() (*logical.LogInput, error) {
 }
 
 // enableAudit is used to enable a new audit backend
-func (c *Core) enableAudit(ctx context.Context, entry *MountEntry, updateStorage bool) error {
+func (c *Core) enableAudit(ctx context.Context, entry *routing.MountEntry, updateStorage bool) error {
 	// Ensure we end the path in a slash
 	if !strings.HasSuffix(entry.Path, "/") {
 		entry.Path += "/"
@@ -150,7 +151,7 @@ func (c *Core) enableAudit(ctx context.Context, entry *MountEntry, updateStorage
 		}
 	}
 
-	newTable := c.audit.shallowClone()
+	newTable := c.audit.ShallowClone()
 	newTable.Entries = append(newTable.Entries, entry)
 
 	ns, err := namespace.FromContext(ctx)
@@ -158,7 +159,7 @@ func (c *Core) enableAudit(ctx context.Context, entry *MountEntry, updateStorage
 		return err
 	}
 	entry.NamespaceID = ns.ID
-	entry.namespace = ns
+	entry.Namespace = ns
 
 	if updateStorage {
 		if err := c.persistAudit(ctx, newTable, entry.Local); err != nil {
@@ -170,9 +171,7 @@ func (c *Core) enableAudit(ctx context.Context, entry *MountEntry, updateStorage
 
 	// Register the backend
 	c.auditBroker.Register(entry.Path, backend, view, entry.Local)
-	if c.logger.IsInfo() {
-		c.logger.Info("enabled audit backend", "path", entry.Path, "type", entry.Type)
-	}
+	c.logger.Info("enabled audit backend", "path", entry.Path, "type", entry.Type)
 
 	return nil
 }
@@ -193,8 +192,8 @@ func (c *Core) disableAudit(ctx context.Context, path string, updateStorage bool
 	c.auditLock.Lock()
 	defer c.auditLock.Unlock()
 
-	newTable := c.audit.shallowClone()
-	entry, err := newTable.remove(ctx, path)
+	newTable := c.audit.ShallowClone()
+	entry, err := newTable.Remove(ctx, path)
 	if err != nil {
 		return false, err
 	}
@@ -223,17 +222,15 @@ func (c *Core) disableAudit(ctx context.Context, path string, updateStorage bool
 
 	// Unmount the backend
 	c.auditBroker.Deregister(path)
-	if c.logger.IsInfo() {
-		c.logger.Info("disabled audit backend", "path", path)
-	}
+	c.logger.Info("disabled audit backend", "path", path)
 
 	return true, nil
 }
 
 // loadAudits is invoked as part of reconcileAudits (which holds the lock) to load the audit table
 func (c *Core) loadAudits(ctx context.Context, readonly bool) error {
-	auditTable := &MountTable{}
-	localAuditTable := &MountTable{}
+	auditTable := &routing.MountTable{}
+	localAuditTable := &routing.MountTable{}
 
 	// Load the existing audit table
 	raw, err := c.barrier.Get(ctx, coreAuditConfigPath)
@@ -304,7 +301,7 @@ func (c *Core) loadAudits(ctx context.Context, readonly bool) error {
 		if ns == nil {
 			return namespace.ErrNoNamespace
 		}
-		entry.namespace = ns
+		entry.Namespace = ns
 	}
 
 	if !needPersist {
@@ -323,17 +320,17 @@ func (c *Core) loadAudits(ctx context.Context, readonly bool) error {
 }
 
 // persistAudit is used to persist the audit table after modification
-func (c *Core) persistAudit(ctx context.Context, table *MountTable, localOnly bool) error {
+func (c *Core) persistAudit(ctx context.Context, table *routing.MountTable, localOnly bool) error {
 	if table.Type != auditTableType {
 		c.logger.Error("given table to persist has wrong type", "actual_type", table.Type, "expected_type", auditTableType)
 		return errors.New("invalid table type given, not persisting")
 	}
 
-	nonLocalAudit := &MountTable{
+	nonLocalAudit := &routing.MountTable{
 		Type: auditTableType,
 	}
 
-	localAudit := &MountTable{
+	localAudit := &routing.MountTable{
 		Type: auditTableType,
 	}
 
@@ -438,9 +435,9 @@ func (c *Core) reconcileAudits(req reconcileAuditsRequests) error {
 	c.auditLock.Lock()
 	defer c.auditLock.Unlock()
 
-	var oldTable *MountTable
+	var oldTable *routing.MountTable
 	if c.audit != nil {
-		oldTable = c.audit.shallowClone()
+		oldTable = c.audit.ShallowClone()
 	}
 
 	if err := c.loadAudits(req.ctx, req.readonly); err != nil {
@@ -448,7 +445,7 @@ func (c *Core) reconcileAudits(req reconcileAuditsRequests) error {
 		return err
 	}
 
-	additions, deletions := oldTable.delta(c.audit)
+	additions, deletions := oldTable.Delta(c.audit)
 
 	var multiErr *multierror.Error
 
@@ -456,9 +453,7 @@ func (c *Core) reconcileAudits(req reconcileAuditsRequests) error {
 		c.removeAuditReloadFunc(entry)
 
 		c.auditBroker.Deregister(entry.Path)
-		if c.logger.IsInfo() {
-			c.logger.Info("disabled audit backend", "path", entry.Path)
-		}
+		c.logger.Info("disabled audit backend", "path", entry.Path)
 	}
 
 	for _, entry := range additions {
@@ -494,9 +489,7 @@ func (c *Core) reconcileAudits(req reconcileAuditsRequests) error {
 
 		// Register the backend
 		c.auditBroker.Register(entry.Path, backend, view, entry.Local)
-		if c.logger.IsInfo() {
-			c.logger.Info("enabled audit backend", "path", entry.Path, "type", entry.Type)
-		}
+		c.logger.Info("enabled audit backend", "path", entry.Path, "type", entry.Type)
 	}
 
 	return multiErr.ErrorOrNil()
@@ -521,15 +514,13 @@ func (c *Core) teardownAudits() error {
 
 // removeAuditReloadFunc removes the reload func from the working set. The
 // audit lock needs to be held before calling this.
-func (c *Core) removeAuditReloadFunc(entry *MountEntry) {
+func (c *Core) removeAuditReloadFunc(entry *routing.MountEntry) {
 	switch entry.Type {
 	case "file":
 		key := "audit_file|" + entry.Path
 		c.reloadFuncsLock.Lock()
 
-		if c.logger.IsDebug() {
-			c.baseLogger.Named("audit").Debug("removing reload function", "path", entry.Path)
-		}
+		c.baseLogger.Named("audit").Debug("removing reload function", "path", entry.Path)
 
 		delete(c.reloadFuncs, key)
 
@@ -538,7 +529,7 @@ func (c *Core) removeAuditReloadFunc(entry *MountEntry) {
 }
 
 // newAuditBackend is used to create and configure a new audit backend by name
-func (c *Core) newAuditBackend(ctx context.Context, entry *MountEntry, view logical.Storage, conf map[string]string) (audit.Backend, error) {
+func (c *Core) newAuditBackend(ctx context.Context, entry *routing.MountEntry, view logical.Storage, conf map[string]string) (audit.Backend, error) {
 	f, ok := c.auditBackends[entry.Type]
 	if !ok {
 		return nil, fmt.Errorf("unknown backend type: %q", entry.Type)
@@ -570,32 +561,24 @@ func (c *Core) newAuditBackend(ctx context.Context, entry *MountEntry, view logi
 
 		c.reloadFuncsLock.Lock()
 
-		if auditLogger.IsDebug() {
-			auditLogger.Debug("adding reload function", "path", entry.Path)
-			if entry.Options != nil {
-				auditLogger.Debug("file backend options", "path", entry.Path, "file_path", entry.Options["file_path"])
-			}
+		auditLogger.Debug("adding reload function", "path", entry.Path)
+		if entry.Options != nil {
+			auditLogger.Debug("file backend options", "path", entry.Path, "file_path", entry.Options["file_path"])
 		}
 
 		c.reloadFuncs[key] = append(c.reloadFuncs[key], func() error {
-			if auditLogger.IsInfo() {
-				auditLogger.Info("reloading file audit backend", "path", entry.Path)
-			}
+			auditLogger.Info("reloading file audit backend", "path", entry.Path)
 			return be.Reload(ctx)
 		})
 
 		c.reloadFuncsLock.Unlock()
 	case "socket":
-		if auditLogger.IsDebug() {
-			if entry.Options != nil {
-				auditLogger.Debug("socket backend options", "path", entry.Path, "address", entry.Options["address"], "socket type", entry.Options["socket_type"])
-			}
+		if entry.Options != nil {
+			auditLogger.Debug("socket backend options", "path", entry.Path, "address", entry.Options["address"], "socket type", entry.Options["socket_type"])
 		}
 	case "syslog":
-		if auditLogger.IsDebug() {
-			if entry.Options != nil {
-				auditLogger.Debug("syslog backend options", "path", entry.Path, "facility", entry.Options["facility"], "tag", entry.Options["tag"])
-			}
+		if entry.Options != nil {
+			auditLogger.Debug("syslog backend options", "path", entry.Path, "facility", entry.Options["facility"], "tag", entry.Options["tag"])
 		}
 	}
 
@@ -603,8 +586,8 @@ func (c *Core) newAuditBackend(ctx context.Context, entry *MountEntry, view logi
 }
 
 // defaultAuditTable creates a default audit table
-func defaultAuditTable() *MountTable {
-	table := &MountTable{
+func defaultAuditTable() *routing.MountTable {
+	table := &routing.MountTable{
 		Type: auditTableType,
 	}
 	return table
@@ -657,20 +640,24 @@ func (c *Core) ReloadAuditLogs() {
 	c.stateLock.RLock()
 	defer c.stateLock.RUnlock()
 
-	if c.activeContext == nil || c.audit == nil {
+	ctx := c.activeContext.Load()
+	if ctx.IsNil() || c.audit == nil {
 		return
 	}
 
-	if err := c.handleAuditLogSetup(c.activeContext, c.standby.Load()); err != nil {
+	if err := c.handleAuditLogSetup(ctx, c.standby.Load()); err != nil {
 		c.logger.Error("failed to set up audit logs on reload", "error", err)
 	}
 }
 
 func (c *Core) handleAuditLogSetup(ctx context.Context, standby bool) error {
-	conf := c.rawConfig.Load().(*server.Config)
+	conf := c.rawConfig.Load()
+	if conf == nil {
+		return errors.New("empty config encountered")
+	}
 
 	c.auditLock.RLock()
-	table := c.audit.shallowClone()
+	table := c.audit.ShallowClone()
 	c.auditLock.RUnlock()
 
 	auditDevicePaths := make(map[string]struct{}, len(conf.Audits))
@@ -696,7 +683,7 @@ func (c *Core) handleAuditLogSetup(ctx context.Context, standby bool) error {
 		// If the device exists in our table, validate it.
 		auditDevicePaths[auditConfig.Path] = struct{}{}
 
-		entry, err := table.findByPath(ctx, auditConfig.Path)
+		entry, err := table.FindByPath(ctx, auditConfig.Path)
 		if err != nil {
 			return fmt.Errorf("while processing audit %v: %w", auditConfig.Path, err)
 		}
@@ -733,7 +720,7 @@ func (c *Core) handleAuditLogSetup(ctx context.Context, standby bool) error {
 		}
 
 		c.logger.Info("disabling removed audit device", "path", auditMount.Path)
-		if existed, err := c.disableAudit(ctx, auditMount.Path, standby); existed && err != nil {
+		if existed, err := c.disableAudit(ctx, auditMount.Path, true); existed && err != nil {
 			return fmt.Errorf("failed to disable removed audit %v: %w", auditMount.Path, err)
 		}
 	}
@@ -749,7 +736,7 @@ func (c *Core) addAuditFromConfig(ctx context.Context, auditConfig *server.Audit
 
 	c.logger.Info("adding new audit device", "path", auditConfig.Path)
 
-	me := &MountEntry{
+	me := &routing.MountEntry{
 		// Config created
 		Table:       configAuditTableType,
 		Path:        auditConfig.Path,
@@ -762,7 +749,7 @@ func (c *Core) addAuditFromConfig(ctx context.Context, auditConfig *server.Audit
 	return c.enableAudit(ctx, me, true)
 }
 
-func (c *Core) validateAuditFromConfig(ctx context.Context, auditConfig *server.AuditDevice, auditEntry *MountEntry) error {
+func (c *Core) validateAuditFromConfig(ctx context.Context, auditConfig *server.AuditDevice, auditEntry *routing.MountEntry) error {
 	if auditEntry.Type != auditConfig.Type {
 		return fmt.Errorf("audit device %v has different types: %v (table) vs %v (config)", auditConfig.Path, auditEntry.Type, auditConfig.Type)
 	}

@@ -26,13 +26,12 @@ import (
 	"google.golang.org/protobuf/proto"
 
 	"github.com/openbao/openbao/api/v2"
-	"github.com/openbao/openbao/command/server"
+	"github.com/openbao/openbao/helper/configutil"
 	"github.com/openbao/openbao/helper/identity"
 	"github.com/openbao/openbao/helper/identity/mfa"
+	"github.com/openbao/openbao/helper/listenerutil"
 	"github.com/openbao/openbao/helper/metricsutil"
 	"github.com/openbao/openbao/helper/namespace"
-	"github.com/openbao/openbao/internalshared/configutil"
-	"github.com/openbao/openbao/internalshared/listenerutil"
 	"github.com/openbao/openbao/sdk/v2/framework"
 	"github.com/openbao/openbao/sdk/v2/helper/consts"
 	"github.com/openbao/openbao/sdk/v2/helper/errutil"
@@ -41,11 +40,13 @@ import (
 	"github.com/openbao/openbao/sdk/v2/helper/policyutil"
 	"github.com/openbao/openbao/sdk/v2/helper/wrapping"
 	"github.com/openbao/openbao/sdk/v2/logical"
+	ident "github.com/openbao/openbao/vault/identity"
+	"github.com/openbao/openbao/vault/policy"
+	"github.com/openbao/openbao/vault/routing"
 	"github.com/openbao/openbao/vault/tokens"
 )
 
 const (
-	replTimeout                           = 1 * time.Second
 	EnvVaultDisableLocalAuthMountEntities = "BAO_DISABLE_LOCAL_AUTH_MOUNT_ENTITIES"
 
 	// coreLockedUsersPath is a base path to store locked users
@@ -67,7 +68,6 @@ var (
 	DefaultMaxJsonStrings = int64(1000)
 
 	ErrNoApplicablePolicies = errors.New("no applicable policies")
-	ErrPolicyNotExist       = errors.New("policy does not exist")
 
 	// restrictedSysAPIs is the set of `sys/` APIs available only in the root namespace.
 	restrictedSysAPIs = pathmanager.New()
@@ -82,7 +82,6 @@ func init() {
 		"config/reload",
 		"config/state",
 		"config/ui",
-		"decode-token",
 		"generate-recovery-token",
 		"generate-root",
 		"health",
@@ -94,9 +93,7 @@ func init() {
 		"internal/counters/activity/monthly",
 		"internal/counters/config",
 		"internal/inspect/router",
-		"key-status",
 		"loggers",
-		"managed-keys",
 		"metrics",
 		"mfa/method",
 		"monitor",
@@ -111,11 +108,6 @@ func init() {
 		"replication/recover",
 		"replication/reindex",
 		"replication/status",
-		"rotate",
-		"rotate/root",
-		"rotate/config",
-		"rotate/keyring",
-		"rotate/keyring/config",
 		"seal",
 		"sealwrap/rewrap",
 		"step-down",
@@ -177,7 +169,7 @@ func (c *Core) fetchEntityAndDerivedPolicies(ctx context.Context, tokenNS *names
 			policies[entity.NamespaceID] = append(policies[entity.NamespaceID], entity.Policies...)
 		}
 
-		groupPolicies, err := c.identityStore.groupPoliciesByEntityID(nsCtx, entity.ID)
+		groupPolicies, err := c.identityStore.GroupPoliciesByEntityID(nsCtx, entity.ID)
 		if err != nil {
 			c.logger.Error("failed to fetch group policies", "error", err)
 			return nil, nil, err
@@ -245,7 +237,7 @@ func (c *Core) getApplicableGroupPolicies(ctx context.Context, tokenNS *namespac
 	for _, policyName := range nsPolicies {
 		policyNSCtx := namespace.ContextWithNamespace(ctx, policyNS)
 		t, err := c.policyStore.GetNonEGPPolicyType(policyNSCtx, policyName)
-		if err != nil && errors.Is(err, ErrPolicyNotExist) {
+		if err != nil && errors.Is(err, policy.ErrPolicyNotExist) {
 			// When we attempt to get a non-EGP policy type, and receive an
 			// explicit error that it doesn't exist (in the type map) we log the
 			// ns/policy and continue without error.
@@ -257,7 +249,7 @@ func (c *Core) getApplicableGroupPolicies(ctx context.Context, tokenNS *namespac
 		}
 
 		switch *t {
-		case PolicyTypeACL:
+		case policy.TypeACL:
 			if policyApplicationMode != groupPolicyApplicationModeWithinNamespaceHierarchy {
 				// Group policy application mode isn't set to enforce
 				// the namespace hierarchy, so apply all the ACLs,
@@ -278,7 +270,7 @@ func (c *Core) getApplicableGroupPolicies(ctx context.Context, tokenNS *namespac
 	return filteredPolicies, nil
 }
 
-func (c *Core) fetchACLTokenEntryAndEntity(ctx context.Context, req *logical.Request) (*ACL, *logical.TokenEntry, *identity.Entity, map[string][]string, error) {
+func (c *Core) fetchACLTokenEntryAndEntity(ctx context.Context, req *logical.Request) (*policy.ACL, *logical.TokenEntry, *identity.Entity, map[string][]string, error) {
 	defer metrics.MeasureSince([]string{"core", "fetch_acl_and_token"}, time.Now())
 
 	// Ensure there is a client token
@@ -317,9 +309,7 @@ func (c *Core) fetchACLTokenEntryAndEntity(ctx context.Context, req *logical.Req
 		var valid bool
 		remoteSockAddr, err := sockaddr.NewSockAddr(req.Connection.RemoteAddr)
 		if err != nil {
-			if c.Logger().IsDebug() {
-				c.Logger().Debug("could not parse remote addr into sockaddr", "error", err, "remote_addr", req.Connection.RemoteAddr)
-			}
+			c.Logger().Debug("could not parse remote addr into sockaddr", "error", err, "remote_addr", req.Connection.RemoteAddr)
 			return nil, nil, nil, nil, logical.ErrPermissionDenied
 		}
 		for _, cidr := range te.BoundCIDRs {
@@ -361,7 +351,7 @@ func (c *Core) fetchACLTokenEntryAndEntity(ctx context.Context, req *logical.Req
 	var tokenCtx context.Context
 	if len(policyNames) == 1 &&
 		len(policyNames[te.NamespaceID]) == 1 &&
-		policyNames[te.NamespaceID][0] == responseWrappingPolicyName &&
+		policyNames[te.NamespaceID][0] == policy.ResponseWrappingPolicyName &&
 		(strings.HasSuffix(req.Path, "sys/wrapping/unwrap") ||
 			strings.HasSuffix(req.Path, "sys/wrapping/lookup") ||
 			strings.HasSuffix(req.Path, "sys/wrapping/rewrap")) {
@@ -374,9 +364,9 @@ func (c *Core) fetchACLTokenEntryAndEntity(ctx context.Context, req *logical.Req
 	}
 
 	// Add the inline policy if it's set
-	policies := make([]*Policy, 0)
+	policies := make([]*policy.Policy, 0)
 	if te.InlinePolicy != "" {
-		inlinePolicy, err := ParseACLPolicy(tokenNS, te.InlinePolicy)
+		inlinePolicy, err := policy.ParseACLPolicy(tokenNS, te.InlinePolicy)
 		if err != nil {
 			return nil, nil, nil, nil, ErrInternalError
 		}
@@ -394,10 +384,10 @@ func (c *Core) fetchACLTokenEntryAndEntity(ctx context.Context, req *logical.Req
 	return acl, te, entity, identityPolicies, nil
 }
 
-func (c *Core) CheckToken(ctx context.Context, req *logical.Request, unauth bool) (*logical.Auth, *ACL, *logical.TokenEntry, *identity.Entity, error) {
+func (c *Core) CheckToken(ctx context.Context, req *logical.Request, unauth bool) (*logical.Auth, *policy.ACL, *logical.TokenEntry, *identity.Entity, error) {
 	defer metrics.MeasureSince([]string{"core", "check_token"}, time.Now())
 
-	var acl *ACL
+	var acl *policy.ACL
 	var te *logical.TokenEntry
 	var entity *identity.Entity
 	var identityPolicies map[string][]string
@@ -534,7 +524,7 @@ func (c *Core) CheckToken(ctx context.Context, req *logical.Request, unauth bool
 
 	// Check the standard non-root ACLs. Return the token entry if it's not
 	// allowed so we can decrement the use count.
-	authResults := c.performPolicyChecks(ctx, acl, te, req, entity, &PolicyCheckOpts{
+	authResults := c.performPolicyChecks(ctx, acl, te, req, entity, &policy.CheckOpts{
 		Unauth:            unauth,
 		RootPrivsRequired: rootPath,
 	})
@@ -584,34 +574,55 @@ func (c *Core) switchedLockHandleRequest(httpCtx context.Context, req *logical.R
 		return nil, consts.ErrSealed
 	}
 
-	if c.activeContext == nil || c.activeContext.Err() != nil {
+	if c.activeContext.Load().Err() != nil {
 		if c.standby.Load() {
 			return nil, logical.ErrPerfStandbyPleaseForward
 		}
 		return nil, errors.New("active context canceled after getting state lock")
 	}
 
-	ctx, cancel := context.WithCancel(c.activeContext)
-	go func(ctx context.Context, httpCtx context.Context) {
-		select {
-		case <-ctx.Done():
-		case <-httpCtx.Done():
-			cancel()
-		}
-	}(ctx, httpCtx)
+	// Bind request cancellation to two contexts: the active context primarily,
+	// so we have a clean context with few values in it, and the http request
+	// context so that if the remote peer closes the connection, we can
+	// properly stop this request.
+	ctx, cancel := context.WithCancel(c.activeContext.Load())
+	defer cancel()
 
-	// A namespace was manually passed to HandleRequest, as can be the case with:
-	// 1. Synthesized logical requests not originating from an HTTP request
-	// 2. Tests
-	ns, err := namespace.FromContext(httpCtx)
-	var nsHeader string
-	if err != nil {
-		// If the above is not the case, resolve the namespace from header & request path.
-		nsHeader = namespace.HeaderFromContext(httpCtx)
-		ns, req.Path = c.namespaceStore.ResolveNamespaceFromRequest(nsHeader, req.Path)
-		if ns == nil {
-			return nil, logical.CodedError(http.StatusNotFound, "namespace not found")
-		}
+	stop := context.AfterFunc(httpCtx, cancel)
+	defer stop()
+
+	nsHeader := namespace.HeaderFromContext(httpCtx)
+	contextNS, err := namespace.FromContext(httpCtx)
+	haveContextNS := err == nil
+
+	if haveContextNS {
+		// If we have a namespace in context, prepend its path to namespace
+		// header. As a result, the namespace header is relative when a
+		// namespace is in context (e.g., if this call originates from the
+		// workflow store), but absolute otherwise. A canonicalized namespace
+		// path ends in a '/', so a basic concatenation is fine.
+		nsHeader = contextNS.Path + nsHeader
+	}
+
+	// Resolve the namespace for this request from header & path.
+	var ns *namespace.Namespace
+	ns, req.Path = c.namespaceStore.ResolveNamespaceFromRequest(nsHeader, req.Path)
+	if ns == nil {
+		return nil, logical.CodedError(http.StatusNotFound, "namespace not found")
+	}
+
+	if haveContextNS && !ns.HasParent(contextNS) {
+		// If we were externally passed a namespace via context previously (as
+		// is the case for some tests and synthetic requests sent within
+		// core), ensure that the namespace resolved above does not escape the
+		// context's namespace. This is important e.g. for the workflow store,
+		// where we'd like subsequent requests to not escape the namespace that
+		// the workflow is hosted in.
+		return nil, logical.CodedError(
+			http.StatusBadRequest,
+			"subsequent request to namespace %q cannot escape namespace %q",
+			ns.Path, contextNS.Path,
+		)
 	}
 
 	if ns.ID != namespace.RootNamespaceID {
@@ -625,9 +636,16 @@ func (c *Core) switchedLockHandleRequest(httpCtx context.Context, req *logical.R
 			}
 		}
 
-		if strings.HasPrefix(req.Path, "sys/") &&
-			restrictedSysAPIs.HasPathSegments(req.Path[len("sys/"):]) {
-			return nil, logical.CodedError(http.StatusBadRequest, "operation unavailable in namespaces")
+		if c.NamespaceSealed(ns) {
+			return nil, consts.ErrNamespaceSealed
+		}
+
+		isRestrictedSysAPI := ns.ID != namespace.RootNamespaceID &&
+			strings.HasPrefix(req.Path, "sys/") &&
+			restrictedSysAPIs.HasPathSegments(req.Path[len("sys/"):])
+
+		if isRestrictedSysAPI {
+			return nil, logical.CodedError(http.StatusBadRequest, "operation only available in root namespace")
 		}
 	}
 	ctx = namespace.ContextWithNamespace(ctx, ns)
@@ -658,7 +676,6 @@ func (c *Core) switchedLockHandleRequest(httpCtx context.Context, req *logical.R
 	}
 	resp, err = c.handleCancelableRequest(ctx, req)
 	req.SetTokenEntry(nil)
-	cancel()
 	return resp, err
 }
 
@@ -1090,13 +1107,13 @@ func (c *Core) handleCancelableRequest(ctx context.Context, req *logical.Request
 	entry := c.router.MatchingMountEntry(ctx, req.Path)
 	if entry != nil {
 		// Get and set ignored HMAC'd value. Reset those back to empty afterwards.
-		if rawVals, ok := entry.synthesizedConfigCache.Load("audit_non_hmac_request_keys"); ok {
+		if rawVals, ok := entry.SynthesizedConfigCache.Load("audit_non_hmac_request_keys"); ok {
 			nonHMACReqDataKeys = rawVals.([]string)
 		}
 
 		// Get and set ignored HMAC'd value. Reset those back to empty afterwards.
 		if auditResp != nil {
-			if rawVals, ok := entry.synthesizedConfigCache.Load("audit_non_hmac_response_keys"); ok {
+			if rawVals, ok := entry.SynthesizedConfigCache.Load("audit_non_hmac_response_keys"); ok {
 				nonHMACRespDataKeys = rawVals.([]string)
 			}
 		}
@@ -1142,7 +1159,7 @@ func (c *Core) handleRequest(ctx context.Context, req *logical.Request) (retResp
 		req.SetMountClass(entry.MountClass())
 
 		// Get and set ignored HMAC'd value.
-		if rawVals, ok := entry.synthesizedConfigCache.Load("audit_non_hmac_request_keys"); ok {
+		if rawVals, ok := entry.SynthesizedConfigCache.Load("audit_non_hmac_request_keys"); ok {
 			nonHMACReqDataKeys = rawVals.([]string)
 		}
 	}
@@ -1191,7 +1208,7 @@ func (c *Core) handleRequest(ctx context.Context, req *logical.Request) (retResp
 			// valid request (this is the token's final use). We pass the ID in
 			// directly just to be safe in case something else modifies te later.
 			defer func(id string) {
-				nsActiveCtx := namespace.ContextWithNamespace(c.activeContext, ns)
+				nsActiveCtx := namespace.ContextWithNamespace(c.activeContext.Load(), ns)
 				leaseID, err := c.expiration.CreateOrFetchRevocationLeaseByToken(nsActiveCtx, te)
 				if err == nil {
 					err = c.expiration.LazyRevoke(ctx, leaseID)
@@ -1501,7 +1518,7 @@ func (c *Core) handleRequest(ctx context.Context, req *logical.Request) (retResp
 	if resp != nil &&
 		req.Path == "cubbyhole/response" &&
 		len(te.Policies) == 1 &&
-		te.Policies[0] == responseWrappingPolicyName {
+		te.Policies[0] == policy.ResponseWrappingPolicyName {
 		resp.AddWarning("Reading from 'cubbyhole/response' is deprecated. Please use sys/wrapping/unwrap to unwrap responses, as it provides additional security checks and other benefits.")
 	}
 
@@ -1531,14 +1548,14 @@ func (c *Core) handleLoginRequest(ctx context.Context, req *logical.Request) (re
 		req.SetMountClass(entry.MountClass())
 
 		// Get and set ignored HMAC'd value.
-		if rawVals, ok := entry.synthesizedConfigCache.Load("audit_non_hmac_request_keys"); ok {
+		if rawVals, ok := entry.SynthesizedConfigCache.Load("audit_non_hmac_request_keys"); ok {
 			nonHMACReqDataKeys = rawVals.([]string)
 		}
 	}
 
 	// Do an unauth check. This will cause EGP policies to be checked
 	var auth *logical.Auth
-	var acl *ACL
+	var acl *policy.ACL
 	var te *logical.TokenEntry
 	var entity *identity.Entity
 	var ctErr error
@@ -1631,7 +1648,7 @@ func (c *Core) handleLoginRequest(ctx context.Context, req *logical.Request) (re
 	// if routeErr has invalid credentials error, update the userFailedLoginMap
 	if routeErr != nil && routeErr == logical.ErrInvalidCredentials {
 		if !isUserLockoutDisabled {
-			err := c.failedUserLoginProcess(ctx, entry, req, userLockoutInfo)
+			err := c.failedUserLoginProcess(ctx, entry, userLockoutInfo)
 			if err != nil {
 				return nil, nil, err
 			}
@@ -1759,7 +1776,7 @@ func (c *Core) handleLoginRequest(ctx context.Context, req *logical.Request) (re
 
 			auth.EntityID = entity.ID
 			auth.EntityCreated = entityCreated
-			validAliases, err := c.identityStore.refreshExternalGroupMembershipsByEntityID(ctx, auth.EntityID, auth.GroupAliases, req.MountAccessor)
+			validAliases, err := c.identityStore.RefreshExternalGroupMembershipsByEntityID(ctx, auth.EntityID, auth.GroupAliases, req.MountAccessor)
 			if err != nil {
 				return nil, nil, err
 			}
@@ -1815,7 +1832,7 @@ func (c *Core) handleLoginRequest(ctx context.Context, req *logical.Request) (re
 				}
 			} else if len(matchedMfaEnforcementList) > 0 && len(req.MFACreds) == 0 {
 				if req.IsInlineAuth {
-					return nil, nil, fmt.Errorf("unable to perform inline authentication with login MFA; use the X-Vault-MFA header to specify MFA information on the inline auth request")
+					return nil, nil, errors.New("unable to perform inline authentication with login MFA; use the X-Vault-MFA header to specify MFA information on the inline auth request")
 				}
 
 				mfaRequestID, err := uuid.GenerateUUID()
@@ -1923,7 +1940,7 @@ func (c *Core) handleLoginRequest(ctx context.Context, req *logical.Request) (re
 // after successful MFA validation to generate the token.
 func (c *Core) LoginCreateToken(ctx context.Context, ns *namespace.Namespace, reqPath, mountPoint, role string, resp *logical.Response, isInlineAuth bool, userLockoutInfo *FailedLoginUser) (bool, *logical.Response, error) {
 	auth := resp.Auth
-	source := strings.TrimPrefix(mountPoint, credentialRoutePrefix)
+	source := strings.TrimPrefix(mountPoint, routing.CredentialRoutePrefix)
 	source = strings.ReplaceAll(source, "/", "-")
 
 	// Prepend the source to the display name
@@ -1960,12 +1977,12 @@ func (c *Core) LoginCreateToken(ctx context.Context, ns *namespace.Namespace, re
 	// Prevent internal policies from being assigned to tokens. We check
 	// this on auth.Policies including derived ones from Identity before
 	// actually making the token.
-	for _, policy := range allPolicies {
-		if policy == "root" {
+	for _, pol := range allPolicies {
+		if pol == "root" {
 			return false, logical.ErrorResponse("auth methods cannot create root tokens"), logical.ErrInvalidRequest
 		}
-		if slices.Contains(nonAssignablePolicies, policy) {
-			return false, logical.ErrorResponse("cannot assign policy %q", policy), logical.ErrInvalidRequest
+		if slices.Contains(policy.NonAssignablePolicies, pol) {
+			return false, logical.ErrorResponse("cannot assign policy %q", pol), logical.ErrInvalidRequest
 		}
 	}
 
@@ -2010,10 +2027,10 @@ func (c *Core) LoginCreateToken(ctx context.Context, ns *namespace.Namespace, re
 	return leaseGenerated, resp, nil
 }
 
-// failedUserLoginProcess updates the userFailedLoginMap with login count and  last failed
-// login time for users with failed login attempt
+// failedUserLoginProcess updates the userFailedLoginMap with login count
+// and last failed login time for users with failed login attempt.
 // If the user gets locked for current login attempt, it updates the storage entry too
-func (c *Core) failedUserLoginProcess(ctx context.Context, mountEntry *MountEntry, req *logical.Request, userLockoutInfo *FailedLoginUser) error {
+func (c *Core) failedUserLoginProcess(ctx context.Context, mountEntry *routing.MountEntry, userLockoutInfo *FailedLoginUser) error {
 	// get the user lockout configuration for the user
 	userLockoutConfiguration := c.getUserLockoutConfiguration(mountEntry)
 
@@ -2041,34 +2058,29 @@ func (c *Core) failedUserLoginProcess(ctx context.Context, mountEntry *MountEntr
 	}
 
 	// update the userFailedLoginInfo map (and/or storage) with the updated/new entry
-	err := c.LocalUpdateUserFailedLoginInfo(ctx, *userLockoutInfo, &failedLoginInfo, false)
-	if err != nil {
-		return err
-	}
-
-	return nil
+	return c.LocalUpdateUserFailedLoginInfo(ctx, *userLockoutInfo, &failedLoginInfo, false)
 }
 
 // getLoginUserInfoKey gets failedUserLoginInfo map key for login user
-func (c *Core) getLoginUserInfoKey(ctx context.Context, mountEntry *MountEntry, req *logical.Request) (FailedLoginUser, error) {
-	userInfo := FailedLoginUser{}
+func (c *Core) getLoginUserInfoKey(ctx context.Context, mountEntry *routing.MountEntry, req *logical.Request) (*FailedLoginUser, error) {
 	aliasName, err := c.aliasNameFromLoginRequest(ctx, req)
 	if err != nil {
-		return userInfo, err
+		return nil, err
 	}
 	if aliasName == "" {
-		return userInfo, errors.New("failed to determine alias name from login request")
+		return nil, errors.New("failed to determine alias name from login request")
 	}
 
-	userInfo.aliasName = aliasName
-	userInfo.mountAccessor = mountEntry.Accessor
-	return userInfo, nil
+	return &FailedLoginUser{
+		aliasName:     aliasName,
+		mountAccessor: mountEntry.Accessor,
+	}, nil
 }
 
 // isUserLockoutDisabled checks if user lockout feature to prevent brute forcing is disabled
 // Auth types userpass, ldap and approle support this feature
 // precedence: environment var setting >> auth tune setting >> config file setting >> default (enabled)
-func (c *Core) isUserLockoutDisabled(mountEntry *MountEntry) (bool, error) {
+func (c *Core) isUserLockoutDisabled(mountEntry *routing.MountEntry) (bool, error) {
 	if !slices.Contains(configutil.GetSupportedUserLockoutsAuthMethods(), mountEntry.Type) {
 		return true, nil
 	}
@@ -2102,8 +2114,8 @@ func (c *Core) isUserLockoutDisabled(mountEntry *MountEntry) (bool, error) {
 	return false, nil
 }
 
-// isUserLocked determines if the login request user is locked
-func (c *Core) isUserLocked(ctx context.Context, mountEntry *MountEntry, req *logical.Request) (loginUser *FailedLoginUser, locked bool, err error) {
+// isUserLocked determines if the user used in login request is locked
+func (c *Core) isUserLocked(ctx context.Context, mountEntry *routing.MountEntry, req *logical.Request) (loginUser *FailedLoginUser, locked bool, err error) {
 	// get userFailedLoginInfo map key for login user
 	loginUserInfoKey, err := c.getLoginUserInfoKey(ctx, mountEntry, req)
 	if err != nil {
@@ -2111,8 +2123,7 @@ func (c *Core) isUserLocked(ctx context.Context, mountEntry *MountEntry, req *lo
 	}
 
 	// get entry from userFailedLoginInfo map for the key
-	userFailedLoginInfo := c.LocalGetUserFailedLoginInfo(ctx, loginUserInfoKey)
-
+	userFailedLoginInfo := c.LocalGetUserFailedLoginInfo(ctx, *loginUserInfoKey)
 	userLockoutConfiguration := c.getUserLockoutConfiguration(mountEntry)
 
 	switch userFailedLoginInfo {
@@ -2123,7 +2134,7 @@ func (c *Core) isUserLocked(ctx context.Context, mountEntry *MountEntry, req *lo
 			return nil, false, fmt.Errorf("could not retrieve namespace from context: %w", err)
 		}
 
-		view := NamespaceView(c.barrier, ns).SubView(coreLockedUsersPath).SubView(loginUserInfoKey.mountAccessor + "/")
+		view := c.NamespaceView(ns).SubView(coreLockedUsersPath + loginUserInfoKey.mountAccessor + "/")
 		existingEntry, err := view.Get(ctx, loginUserInfoKey.aliasName)
 		if err != nil {
 			return nil, false, err
@@ -2132,22 +2143,21 @@ func (c *Core) isUserLocked(ctx context.Context, mountEntry *MountEntry, req *lo
 		var lastLoginTime int
 		if existingEntry == nil {
 			// no storage entry found, user is not locked
-			return &loginUserInfoKey, false, nil
+			return loginUserInfoKey, false, nil
 		}
 
-		err = jsonutil.DecodeJSON(existingEntry.Value, &lastLoginTime)
-		if err != nil {
+		if err = jsonutil.DecodeJSON(existingEntry.Value, &lastLoginTime); err != nil {
 			return nil, false, err
 		}
 
 		// if time passed from last login time is within lockout duration, the user is locked
 		if time.Now().Unix()-int64(lastLoginTime) < int64(userLockoutConfiguration.LockoutDuration.Seconds()) {
 			// user locked
-			return &loginUserInfoKey, true, nil
+			return loginUserInfoKey, true, nil
 		}
 
-		// else user is not locked. Entry is stale, this will be removed from storage during cleanup
-		// by the background thread
+		// else user is not locked. Entry is stale, this will be
+		// removed from storage during cleanup by the background thread
 
 	default:
 		// entry found in userFailedLoginInfo map, check if the user is locked
@@ -2156,19 +2166,23 @@ func (c *Core) isUserLocked(ctx context.Context, mountEntry *MountEntry, req *lo
 
 		if isCountOverLockoutThreshold && isWithinLockoutDuration {
 			// user locked
-			return &loginUserInfoKey, true, nil
+			return loginUserInfoKey, true, nil
 		}
 	}
 
-	return &loginUserInfoKey, false, nil
+	return loginUserInfoKey, false, nil
 }
 
-// getUserLockoutConfiguration gets the user lockout configuration for a mount entry
-// it checks the config file and auth tune values
-// precedence: auth tune >> config file values for auth type >> config file values for all type
-// >> default user lockout values
+// getUserLockoutConfiguration gets the user lockout configuration
+// for a mount entry, checking the config file and auth tune values
+// precedence:
+//  1. auth tune
+//  2. config file values for auth type
+//  3. config file values for all type
+//  4. default user lockout values
+//
 // getUserLockoutFromConfig call in this function takes care of config file precedence
-func (c *Core) getUserLockoutConfiguration(mountEntry *MountEntry) (userLockoutConfig UserLockoutConfig) {
+func (c *Core) getUserLockoutConfiguration(mountEntry *routing.MountEntry) (userLockoutConfig routing.UserLockoutConfig) {
 	// get user configuration values from config file
 	userLockoutConfig = c.getUserLockoutFromConfig(mountEntry.Type)
 
@@ -2203,8 +2217,8 @@ func (c *Core) getUserLockoutConfiguration(mountEntry *MountEntry) (userLockoutC
 // similarly missing values for a given mount type in config file are updated with "all" type
 // default values
 // If user_lockout configuration is not configured using config file at all, defaults are returned
-func (c *Core) getUserLockoutFromConfig(mountType string) UserLockoutConfig {
-	defaultUserLockoutConfig := UserLockoutConfig{
+func (c *Core) getUserLockoutFromConfig(mountType string) routing.UserLockoutConfig {
+	defaultUserLockoutConfig := routing.UserLockoutConfig{
 		LockoutThreshold:    configutil.UserLockoutThresholdDefault,
 		LockoutDuration:     configutil.UserLockoutDurationDefault,
 		LockoutCounterReset: configutil.UserLockoutCounterResetDefault,
@@ -2214,21 +2228,21 @@ func (c *Core) getUserLockoutFromConfig(mountType string) UserLockoutConfig {
 	if conf == nil {
 		return defaultUserLockoutConfig
 	}
-	userlockouts := conf.(*server.Config).UserLockouts
+	userlockouts := conf.UserLockouts
 	if userlockouts == nil {
 		return defaultUserLockoutConfig
 	}
 	for _, userLockoutConfig := range userlockouts {
 		switch userLockoutConfig.Type {
 		case "all":
-			defaultUserLockoutConfig = UserLockoutConfig{
+			defaultUserLockoutConfig = routing.UserLockoutConfig{
 				LockoutThreshold:    userLockoutConfig.LockoutThreshold,
 				LockoutDuration:     userLockoutConfig.LockoutDuration,
 				LockoutCounterReset: userLockoutConfig.LockoutCounterReset,
 				DisableLockout:      userLockoutConfig.DisableLockout,
 			}
 		case mountType:
-			return UserLockoutConfig{
+			return routing.UserLockoutConfig{
 				LockoutThreshold:    userLockoutConfig.LockoutThreshold,
 				LockoutDuration:     userLockoutConfig.LockoutDuration,
 				LockoutCounterReset: userLockoutConfig.LockoutCounterReset,
@@ -2250,7 +2264,7 @@ func (c *Core) buildMfaEnforcementResponse(eConfig *mfa.MFAEnforcementConfig) (*
 			return nil, fmt.Errorf("failed to get methodID %s from MFA config table, error: %v", methodID, err)
 		}
 		var duoUsePasscode bool
-		if mConfig.Type == mfaMethodTypeDuo {
+		if mConfig.Type == ident.MfaMethodTypeDuo {
 			duoConf, ok := mConfig.Config.(*mfa.Config_DuoConfig)
 			if !ok {
 				return nil, errors.New("invalid MFA configuration type")
@@ -2260,7 +2274,7 @@ func (c *Core) buildMfaEnforcementResponse(eConfig *mfa.MFAEnforcementConfig) (*
 		mfaMethod := &logical.MFAMethodID{
 			Type:         mConfig.Type,
 			ID:           methodID,
-			UsesPasscode: mConfig.Type == mfaMethodTypeTOTP || duoUsePasscode,
+			UsesPasscode: mConfig.Type == ident.MfaMethodTypeTOTP || duoUsePasscode,
 			Name:         mConfig.Name,
 		}
 		mfaAny.Any = append(mfaAny.Any, mfaMethod)
@@ -2352,18 +2366,16 @@ func (c *Core) RegisterAuth(ctx context.Context, tokenTTL time.Duration, path st
 	return &te, nil
 }
 
-// LocalGetUserFailedLoginInfo gets the failed login information for a user based on alias name and mountAccessor
+// LocalGetUserFailedLoginInfo gets the failed login information for
+// a user based on alias name and mountAccessor
 func (c *Core) LocalGetUserFailedLoginInfo(ctx context.Context, userKey FailedLoginUser) *FailedLoginInfo {
 	c.userFailedLoginInfoLock.Lock()
-	value, exists := c.userFailedLoginInfo[userKey]
-	c.userFailedLoginInfoLock.Unlock()
-	if exists {
-		return value
-	}
-	return nil
+	defer c.userFailedLoginInfoLock.Unlock()
+	return c.userFailedLoginInfo[userKey]
 }
 
-// LocalUpdateUserFailedLoginInfo updates the failed login information for a user based on alias name and mountAccessor
+// LocalUpdateUserFailedLoginInfo updates the failed login information for
+// a user based on alias name and mountAccessor
 func (c *Core) LocalUpdateUserFailedLoginInfo(ctx context.Context, userKey FailedLoginUser, failedLoginInfo *FailedLoginInfo, deleteEntry bool) error {
 	c.userFailedLoginInfoLock.Lock()
 	defer c.userFailedLoginInfoLock.Unlock()
@@ -2380,7 +2392,7 @@ func (c *Core) LocalUpdateUserFailedLoginInfo(ctx context.Context, userKey Faile
 	// get the user lockout configuration for the user
 	mountEntry := c.router.MatchingMountByAccessor(userKey.mountAccessor)
 	if mountEntry == nil {
-		mountEntry = &MountEntry{namespace: namespace.RootNamespace}
+		mountEntry = &routing.MountEntry{Namespace: namespace.RootNamespace}
 	}
 	userLockoutConfiguration := c.getUserLockoutConfiguration(mountEntry)
 
@@ -2389,7 +2401,7 @@ func (c *Core) LocalUpdateUserFailedLoginInfo(ctx context.Context, userKey Faile
 		// user locked
 		compressedBytes, err := jsonutil.EncodeJSONAndCompress(failedLoginInfo.lastFailedLoginTime, nil)
 		if err != nil {
-			c.logger.Error("failed to encode or compress failed login user entry", "namespace", mountEntry.namespace.Path, "error", err)
+			c.logger.Error("failed to encode or compress failed login user entry", "namespace", mountEntry.Namespace.Path, "error", err)
 			return err
 		}
 
@@ -2400,9 +2412,9 @@ func (c *Core) LocalUpdateUserFailedLoginInfo(ctx context.Context, userKey Faile
 		}
 
 		// Write to the physical backend
-		view := NamespaceView(c.barrier, mountEntry.namespace).SubView(coreLockedUsersPath).SubView(userKey.mountAccessor + "/")
+		view := c.NamespaceView(mountEntry.Namespace).SubView(coreLockedUsersPath + userKey.mountAccessor + "/")
 		if err := view.Put(ctx, entry); err != nil {
-			c.logger.Error("failed to persist failed login user entry", "namespace", mountEntry.namespace.Path, "error", err)
+			c.logger.Error("failed to persist failed login user entry", "namespace", mountEntry.Namespace.Path, "error", err)
 			return err
 		}
 

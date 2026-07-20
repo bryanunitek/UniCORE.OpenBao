@@ -29,13 +29,13 @@ func TestGrabLockOrStop(t *testing.T) {
 	)
 	done := make(chan struct{})
 	defer close(done)
-	var lockCount int64
+	lockCount := atomic.Uint32{}
 	go func() {
 		select {
 		case <-done:
 		case <-time.After(testTimeout):
 			panic(fmt.Sprintf("deadlock after %d lock count",
-				atomic.LoadInt64(&lockCount)))
+				lockCount.Load()))
 		}
 	}()
 
@@ -49,7 +49,6 @@ func TestGrabLockOrStop(t *testing.T) {
 
 	// Start a bunch of worker goroutines.
 	for g := range workers {
-		g := g
 		go func() {
 			defer workerWg.Done()
 			for time.Since(start) < testDuration {
@@ -58,14 +57,12 @@ func TestGrabLockOrStop(t *testing.T) {
 				// closerWg waits until the closer goroutine exits before we do
 				// another iteration. This makes sure goroutines don't pile up.
 				var closerWg sync.WaitGroup
-				closerWg.Add(1)
-				go func() {
-					defer closerWg.Done()
+				closerWg.Go(func() {
 					// Close the stop channel half the time.
 					if rand.Int()%2 == 0 {
 						close(stop)
 					}
-				}()
+				})
 
 				// Half the goroutines lock/unlock and the other half rlock/runlock.
 				if g%2 == 0 {
@@ -82,7 +79,7 @@ func TestGrabLockOrStop(t *testing.T) {
 
 				// This lets us know how many lock/unlock and rlock/runlock have
 				// happened if there's a deadlock.
-				atomic.AddInt64(&lockCount, 1)
+				lockCount.Add(1)
 			}
 		}()
 	}
@@ -114,7 +111,7 @@ func testCoreRestart(t *testing.T, core int) {
 	TestWaitActive(t, c.Cores[0].Core)
 
 	c.Cores[core].stateLock.RLock()
-	activeContextDone := c.Cores[core].activeContext.Done()
+	activeContextDone := c.Cores[core].activeContext.Load().Done()
 	c.Cores[core].stateLock.RUnlock()
 
 	// trigger the restart
@@ -131,7 +128,7 @@ func testCoreRestart(t *testing.T, core int) {
 	require.EventuallyWithT(t, func(t *assert.CollectT) {
 		c.Cores[core].stateLock.RLock()
 		defer c.Cores[core].stateLock.RUnlock()
-		require.NotNil(t, c.Cores[core].activeContext)
-		require.Nil(t, c.Cores[core].activeContext.Err())
+		require.NotNil(t, c.Cores[core].activeContext.Load())
+		require.Nil(t, c.Cores[core].activeContext.Load().Err())
 	}, 10*time.Second, 10*time.Millisecond)
 }

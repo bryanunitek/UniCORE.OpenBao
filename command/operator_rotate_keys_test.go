@@ -11,10 +11,10 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/openbao/openbao/sdk/v2/helper/roottoken"
 	"github.com/stretchr/testify/require"
 
 	"github.com/hashicorp/cli"
+	"github.com/hashicorp/go-secure-stdlib/base62"
 	"github.com/openbao/openbao/api/v2"
 )
 
@@ -264,7 +264,7 @@ func TestOperatorRotateKeysCommand_Run(t *testing.T) {
 		rootStatus, err := client.Sys().GenerateRootStatus()
 		require.NoError(t, err)
 
-		otp, err := roottoken.GenerateOTP(rootStatus.OTPLength)
+		otp, err := base62.Random(rootStatus.OTPLength)
 		require.NoError(t, err)
 
 		genRoot, err := client.Sys().GenerateRootInit(otp, "")
@@ -462,11 +462,12 @@ func TestOperatorRotateKeysCommand_Run(t *testing.T) {
 		rootStatus, err := client.Sys().GenerateRootStatus()
 		require.NoError(t, err)
 
-		otp, err := roottoken.GenerateOTP(rootStatus.OTPLength)
+		otp, err := base62.Random(rootStatus.OTPLength)
 		require.NoError(t, err)
 
 		genRoot, err := client.Sys().GenerateRootInit(otp, "")
 		require.NoError(t, err)
+		require.NotEmpty(t, genRoot.Nonce)
 
 		r, err := client.Sys().GenerateRootUpdate(recoveryKey, genRoot.Nonce)
 		require.NoError(t, err)
@@ -496,7 +497,7 @@ func TestOperatorRotateKeysCommand_Run(t *testing.T) {
 		require.NoError(t, err)
 		nonce := status.Nonce
 
-		var combined string
+		var combined strings.Builder
 		// Supply the unseal keys
 		for _, key := range keys {
 			ui, cmd := testOperatorRotateKeysCommand(t)
@@ -509,11 +510,11 @@ func TestOperatorRotateKeysCommand_Run(t *testing.T) {
 			require.Equalf(t, 0, code, "expected %d to be %d: %s", code, 0, ui.ErrorWriter.String())
 
 			// Append to our output string
-			combined += ui.OutputWriter.String()
+			combined.WriteString(ui.OutputWriter.String())
 		}
 
 		re := regexp.MustCompile(`Key 1 fingerprint: (.+); value: (.+)`)
-		match := re.FindAllStringSubmatch(combined, -1)
+		match := re.FindAllStringSubmatch(combined.String(), -1)
 		require.False(t, len(match) < 1 || len(match[0]) < 3)
 
 		// Grab the output fingerprint and encrypted key

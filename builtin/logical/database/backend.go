@@ -6,6 +6,7 @@ package database
 import (
 	"context"
 	"fmt"
+	"maps"
 	"net/rpc"
 	"strings"
 	"sync"
@@ -14,8 +15,8 @@ import (
 	log "github.com/hashicorp/go-hclog"
 	metrics "github.com/hashicorp/go-metrics/compat"
 	"github.com/hashicorp/go-uuid"
+	"github.com/openbao/openbao/helper/configutil"
 	"github.com/openbao/openbao/helper/metricsutil"
-	"github.com/openbao/openbao/internalshared/configutil"
 	v4 "github.com/openbao/openbao/sdk/v2/database/dbplugin"
 	v5 "github.com/openbao/openbao/sdk/v2/database/dbplugin/v5"
 	"github.com/openbao/openbao/sdk/v2/framework"
@@ -72,7 +73,8 @@ func Factory(ctx context.Context, conf *logical.BackendConfig) (logical.Backend,
 		metrics.Default(),
 		configutil.UsageGaugeDefaultPeriod, // TODO: add config settings for these, or add plumbing to the main config settings
 		configutil.MaximumGaugeCardinalityDefault,
-		b.logger)
+		b.logger,
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -129,9 +131,7 @@ func (b *databaseBackend) collectPluginInstanceGaugeValues(context.Context) ([]m
 		b.connLock.RLock()
 		defer b.connLock.RUnlock()
 		mapCopy := map[string]*dbPluginInstance{}
-		for k, v := range b.connections {
-			mapCopy[k] = v
-		}
+		maps.Copy(mapCopy, b.connections)
 		return mapCopy
 	}()
 	counts := map[string]int{}

@@ -415,7 +415,7 @@ func (ah *AuthHandler) Run(ctx context.Context, am AuthMethod) error {
 
 				tokenType := secret.Data["type"].(string)
 				if tokenType == "batch" {
-					ah.logger.Info("note that this token type is batch, and batch tokens cannot be renewed", "ttl", leaseDuration)
+					ah.logger.Info("note that this token type is batch and batch tokens cannot be renewed", "ttl", leaseDuration)
 				}
 			} else {
 				if secret == nil || secret.Auth == nil {
@@ -535,11 +535,7 @@ func newAutoAuthBackoff(min, max time.Duration, exitErr bool) *autoAuthBackoff {
 // next determines the next backoff duration that is roughly twice
 // the current value, capped to a max value, with a measure of randomness.
 func (b *autoAuthBackoff) next() {
-	maxBackoff := 2 * b.current
-
-	if maxBackoff > b.max {
-		maxBackoff = b.max
-	}
+	maxBackoff := min(2*b.current, b.max)
 
 	// Trim a random amount (0-25%) off the doubled duration
 	trim := rand.Int63n(int64(maxBackoff) / 4)

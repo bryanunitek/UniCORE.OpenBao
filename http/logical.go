@@ -4,6 +4,8 @@
 package http
 
 import (
+	"crypto/subtle"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -132,15 +134,8 @@ func buildLogicalRequestNoAuth(w http.ResponseWriter, r *http.Request) (*logical
 
 				data = formData
 			} else {
-				err = parseJSONRequest(r, w, &data)
-				if err == io.EOF {
-					data = nil
-					err = nil
-				}
-				if err != nil {
-					status := http.StatusBadRequest
-					logical.AdjustErrorStatusCode(&status, err)
-					return nil, status, errors.New("error parsing JSON")
+				if err := parseJSONRequest(r, &data); err != nil && !errors.Is(err, io.EOF) {
+					return nil, http.StatusBadRequest, err
 				}
 			}
 		}
@@ -160,17 +155,8 @@ func buildLogicalRequestNoAuth(w http.ResponseWriter, r *http.Request) (*logical
 			return nil, http.StatusUnsupportedMediaType, fmt.Errorf("PATCH requires Content-Type of %s, provided %s", MergePatchContentTypeHeader, contentType)
 		}
 
-		err = parseJSONRequest(r, w, &data)
-
-		if err == io.EOF {
-			data = nil
-			err = nil
-		}
-
-		if err != nil {
-			status := http.StatusBadRequest
-			logical.AdjustErrorStatusCode(&status, err)
-			return nil, status, errors.New("error parsing JSON")
+		if err := parseJSONRequest(r, &data); err != nil && !errors.Is(err, io.EOF) {
+			return nil, http.StatusBadRequest, err
 		}
 
 	case "LIST":
@@ -200,13 +186,19 @@ func buildLogicalRequestNoAuth(w http.ResponseWriter, r *http.Request) (*logical
 		return nil, http.StatusInternalServerError, fmt.Errorf("failed to generate identifier for the request: %w", err)
 	}
 
+	// The http package removes the Host header when deserializing
+	// the http request.  This adds it back in so it is available
+	// in the logical request.
+	reqHeader := r.Header.Clone()
+	reqHeader.Add("Host", r.Host)
+
 	req := &logical.Request{
 		ID:         requestId,
 		Operation:  op,
 		Path:       path,
 		Data:       data,
 		Connection: getConnection(r),
-		Headers:    r.Header.Clone(),
+		Headers:    reqHeader,
 	}
 
 	if passHTTPReq {
@@ -297,14 +289,9 @@ func buildLogicalRequest(core *vault.Core, w http.ResponseWriter, r *http.Reques
 		return nil, http.StatusBadRequest, fmt.Errorf("error parsing X-Vault-Wrap-TTL header: %w", err)
 	}
 
-	err = parseMFAHeader(req)
+	err = req.ParseMFAHeaders()
 	if err != nil {
 		return nil, http.StatusBadRequest, fmt.Errorf("failed to parse X-Vault-MFA header: %w", err)
-	}
-
-	err = requestPolicyOverride(r, req)
-	if err != nil {
-		return nil, http.StatusBadRequest, fmt.Errorf("failed to parse %s header: %w", PolicyOverrideHeaderName, err)
 	}
 
 	return req, 0, nil
@@ -341,8 +328,10 @@ func handleLogicalRecovery(raw *vault.RawBackend, token *atomic.Value) http.Hand
 			respondError(w, statusCode, err)
 			return
 		}
+
 		reqToken := r.Header.Get(consts.AuthHeaderName)
-		if reqToken == "" || token.Load() == "" || reqToken != token.Load() {
+		rToken, rTokenOk := token.Load().(string)
+		if len(reqToken) == 0 || !rTokenOk || len(rToken) == 0 || subtle.ConstantTimeCompare([]byte(reqToken), []byte(rToken)) == 0 {
 			respondError(w, http.StatusForbidden, nil)
 			return
 		}
@@ -423,7 +412,7 @@ func respondLogical(core *vault.Core, w http.ResponseWriter, r *http.Request, re
 
 		// Check if this is a raw response
 		if _, ok := resp.Data[logical.HTTPStatusCode]; ok {
-			respondRaw(w, r, resp)
+			respondRaw(w, resp)
 			return
 		}
 
@@ -462,9 +451,9 @@ func respondLogical(core *vault.Core, w http.ResponseWriter, r *http.Request, re
 // respondRaw is used when the response is using HTTPContentType and HTTPRawBody
 // to change the default response handling. This is only used for specific things like
 // returning the CRL information on the PKI backends.
-func respondRaw(w http.ResponseWriter, r *http.Request, resp *logical.Response) {
+func respondRaw(w http.ResponseWriter, resp *logical.Response) {
 	retErr := func(w http.ResponseWriter, err string) {
-		w.Header().Set("X-Vault-Raw-Error", err)
+		w.Header().Set(consts.RawErrorHeaderName, err)
 		w.WriteHeader(http.StatusInternalServerError)
 		w.Write(nil)
 	}
@@ -587,5 +576,37 @@ func getConnection(r *http.Request) (connection *logical.Connection) {
 		RemotePort: remotePort,
 		ConnState:  r.TLS,
 	}
+
+	if r.TLS != nil {
+		connection.PeerCertificates = r.TLS.PeerCertificates
+	}
+
+	connection.ProxiedCertificates = handleForwardedCertHeaders(r)
+
 	return connection
+}
+
+// handleForwardedCertHeaders handles proxied/forwarded client certificates
+// from TLS terminated by an earlier reverse proxy.
+func handleForwardedCertHeaders(req *http.Request) []*x509.Certificate {
+	// We know we only set a single value.
+	headerValue := req.Header.Get(ProcessedForwardedClientCertHeader)
+	if len(headerValue) == 0 {
+		return nil
+	}
+
+	// Subsequent errors in this function should not occur:
+	// wrapClientCertificateHandler has previously validated this exact
+	// flow.
+	certDER, err := base64.StdEncoding.DecodeString(headerValue)
+	if err != nil {
+		return nil
+	}
+
+	x509ClientCert, err := x509.ParseCertificate(certDER)
+	if err != nil {
+		return nil
+	}
+
+	return []*x509.Certificate{x509ClientCert}
 }

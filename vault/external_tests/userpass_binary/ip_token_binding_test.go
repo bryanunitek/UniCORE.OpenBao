@@ -7,11 +7,13 @@ import (
 	"context"
 	_ "embed"
 	"encoding/json"
+	"fmt"
 	"testing"
 	"time"
 
 	"github.com/openbao/openbao/api/auth/userpass/v2"
 	"github.com/openbao/openbao/api/v2"
+	"github.com/openbao/openbao/sdk/v2/helper/consts"
 	hDocker "github.com/openbao/openbao/sdk/v2/helper/docker"
 	"github.com/openbao/openbao/sdk/v2/helper/testcluster"
 	"github.com/openbao/openbao/sdk/v2/helper/testcluster/docker"
@@ -39,7 +41,8 @@ func Test_StrictIPBinding(t *testing.T) {
 		VaultBinary: binary,
 		ClusterOptions: testcluster.ClusterOptions{
 			VaultNodeConfig: &testcluster.VaultNodeConfig{
-				LogLevel: "TRACE",
+				LogLevel:       "TRACE",
+				AuditLogStdout: true,
 			},
 			NumCores: 1,
 		},
@@ -48,7 +51,7 @@ func Test_StrictIPBinding(t *testing.T) {
 	cluster := docker.NewTestDockerCluster(t, opts)
 	defer cluster.Cleanup()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), 60*time.Second)
 	defer cancel()
 	nodeIndex, err := testcluster.WaitForActiveNode(ctx, cluster)
 	require.NoError(t, err)
@@ -75,7 +78,8 @@ func Test_StrictIPBinding(t *testing.T) {
 	require.NoError(t, err)
 
 	// Login to userpass and attempt to use it via cURL.
-	up, err := userpass.NewUserpassAuth("testing",
+	up, err := userpass.NewUserpassAuth(
+		"testing",
 		&userpass.Password{
 			FromString: "password",
 		},
@@ -111,7 +115,7 @@ func Test_StrictIPBinding(t *testing.T) {
 		"curl",
 		"-sSL",
 		"--insecure",
-		"--header", "X-Vault-Token: " + localToken,
+		"--header", fmt.Sprintf("%s: %s", consts.AuthHeaderName, localToken),
 		"https://" + vaultAddr + ":8200/v1/sys/host-info",
 	}
 	stdout, stderr, retcode, err := curlRunner.RunCmdWithOutput(ctx, curlResult.Container.ID, curlCmd)
@@ -159,7 +163,7 @@ func Test_StrictIPBinding(t *testing.T) {
 
 	// Using the remote token locally should fail...
 	cloned.SetToken(remoteToken)
-	resp, err = cloned.Logical().Read("sys/host-info")
+	_, err = cloned.Logical().Read("sys/host-info")
 	require.Error(t, err)
 
 	// ...but using it remotely should work fine
@@ -167,7 +171,7 @@ func Test_StrictIPBinding(t *testing.T) {
 		"curl",
 		"-sSL",
 		"--insecure",
-		"--header", "X-Vault-Token: " + remoteToken,
+		"--header", fmt.Sprintf("%s: %s", consts.AuthHeaderName, remoteToken),
 		"https://" + vaultAddr + ":8200/v1/sys/host-info",
 	}
 	stdout, stderr, retcode, err = curlRunner.RunCmdWithOutput(ctx, curlResult.Container.ID, curlCmd)

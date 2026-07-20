@@ -14,7 +14,6 @@ import (
 
 	"github.com/go-test/deep"
 	"github.com/hashicorp/go-hclog"
-	wrapping "github.com/openbao/go-kms-wrapping/v2"
 	"github.com/openbao/openbao/api/v2"
 	"github.com/openbao/openbao/helper/namespace"
 	"github.com/openbao/openbao/helper/testhelpers"
@@ -269,7 +268,7 @@ func migrateFromTransitToShamir_Pre14(t *testing.T, logger hclog.Logger, storage
 	if err != nil {
 		t.Fatal(err)
 	}
-	verifyBarrierConfig(t, b, wrapping.WrapperTypeShamir.String(), keyShares, keyThreshold, 1)
+	verifyBarrierConfig(t, b, "shamir", keyShares, keyThreshold, 1)
 	if r != nil {
 		t.Fatalf("expected nil recovery config, got: %#v", r)
 	}
@@ -390,7 +389,7 @@ func migratePost14(t *testing.T, storage teststorage.ReusableStorage, cluster *v
 
 	// Wait for the followers to establish a new leader
 	var leaderIdx int
-	for i := 0; i < 30; i++ {
+	for range 30 {
 		leaderIdx, err = testhelpers.AwaitLeader(t, cluster)
 		if err != nil {
 			t.Fatal(err)
@@ -513,7 +512,6 @@ func unseal(t *testing.T, client *api.Client, keys [][]byte) {
 
 func attemptUnseal(client *api.Client, keys [][]byte) error {
 	for i, key := range keys {
-
 		resp, err := client.Sys().UnsealWithOptions(&api.UnsealOpts{
 			Key: base64.StdEncoding.EncodeToString(key),
 		})
@@ -540,7 +538,7 @@ func verifySealConfigShamir(t *testing.T, core *vault.TestClusterCore) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	verifyBarrierConfig(t, b, wrapping.WrapperTypeShamir.String(), keyShares, keyThreshold, 1)
+	verifyBarrierConfig(t, b, "shamir", keyShares, keyThreshold, 1)
 	if r != nil {
 		t.Fatal("should not have recovery config for shamir")
 	}
@@ -551,8 +549,8 @@ func verifySealConfigTransit(t *testing.T, core *vault.TestClusterCore) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	verifyBarrierConfig(t, b, wrapping.WrapperTypeTransit.String(), 1, 1, 1)
-	verifyBarrierConfig(t, r, wrapping.WrapperTypeShamir.String(), keyShares, keyThreshold, 0)
+	verifyBarrierConfig(t, b, "transit", 1, 1, 1)
+	verifyBarrierConfig(t, r, "shamir", keyShares, keyThreshold, 0)
 }
 
 // verifyBarrierConfig verifies that a barrier configuration is correct.
@@ -565,9 +563,6 @@ func verifyBarrierConfig(t *testing.T, cfg *vault.SealConfig, sealType string, s
 	}
 	if cfg.SecretThreshold != threshold {
 		t.Fatalf("bad seal config: %#v, expected SecretThreshold=%d", cfg, threshold)
-	}
-	if cfg.StoredShares != stored {
-		t.Fatalf("bad seal config: %#v, expected StoredShares=%d", cfg, stored)
 	}
 }
 

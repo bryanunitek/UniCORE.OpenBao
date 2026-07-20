@@ -18,6 +18,8 @@ import (
 	credUserpass "github.com/openbao/openbao/builtin/credential/userpass"
 	"github.com/openbao/openbao/helper/namespace"
 	"github.com/openbao/openbao/sdk/v2/logical"
+	backendTest "github.com/openbao/openbao/vault/backend"
+	"github.com/openbao/openbao/vault/routing"
 	"github.com/stretchr/testify/require"
 )
 
@@ -27,8 +29,8 @@ func TestRequestHandling_Wrapping(t *testing.T) {
 	core.logicalBackends["kv"] = PassthroughBackendFactory
 
 	meUUID, _ := uuid.GenerateUUID()
-	err := core.mount(namespace.RootContext(t.Context()), &MountEntry{
-		Table: mountTableType,
+	err := core.mount(namespace.RootContext(t.Context()), &routing.MountEntry{
+		Table: routing.MountTableType,
 		UUID:  meUUID,
 		Path:  "wraptest",
 		Type:  "kv",
@@ -415,7 +417,8 @@ func TestRequestHandling_LoginMetric(t *testing.T) {
 	}
 
 	// There should be two counters
-	checkCounter(t, sink, "token.creation",
+	checkCounter(
+		t, sink, "token.creation",
 		map[string]string{
 			"cluster":      "test-cluster",
 			"namespace":    "root",
@@ -425,7 +428,8 @@ func TestRequestHandling_LoginMetric(t *testing.T) {
 			"token_type":   "service",
 		},
 	)
-	checkCounter(t, sink, "token.creation",
+	checkCounter(
+		t, sink, "token.creation",
 		map[string]string{
 			"cluster":      "test-cluster",
 			"namespace":    "root",
@@ -467,7 +471,8 @@ func TestRequestHandling_SecretLeaseMetric(t *testing.T) {
 		t.Fatalf("bad: %#v", resp)
 	}
 
-	checkCounter(t, sink, "secret.lease.creation",
+	checkCounter(
+		t, sink, "secret.lease.creation",
 		map[string]string{
 			"cluster":       "test-cluster",
 			"namespace":     "root",
@@ -724,12 +729,14 @@ path "secret/metadata/by-metadata/subdir/both" {
 					}
 
 					onList, present := entries[entry]
-					require.True(t,
+					require.True(
+						t,
 						present,
 						"list included %v but shouldn't have; path: %v\n\texpected: %#v\n\tactual: %#v", entry, req.Path, entries, resp.Data["keys"].([]string),
 					)
 
-					require.False(t,
+					require.False(
+						t,
 						req.Operation == logical.ListOperation && !onList,
 						"list operation included recursive entry %v\n\tactual: %#v", entry, resp.Data["keys"].([]string),
 					)
@@ -790,8 +797,8 @@ func TestRequestHandling_DisallowLogicalTokenCreation(t *testing.T) {
 		t.Fatalf("err: %v", err)
 	}
 
-	core.logicalBackends["test"] = func(ctx context.Context, conf *logical.BackendConfig) (logical.Backend, error) {
-		return &NoopBackend{
+	core.logicalBackends["test"] = func(context.Context, *logical.BackendConfig) (logical.Backend, error) {
+		return &backendTest.Noop{
 			Login: []string{"login"},
 			Response: &logical.Response{
 				Auth: &logical.Auth{},
@@ -800,8 +807,8 @@ func TestRequestHandling_DisallowLogicalTokenCreation(t *testing.T) {
 	}
 
 	meUUID, _ := uuid.GenerateUUID()
-	err := core.mount(namespace.RootContext(t.Context()), &MountEntry{
-		Table: mountTableType,
+	err := core.mount(namespace.RootContext(t.Context()), &routing.MountEntry{
+		Table: routing.MountTableType,
 		UUID:  meUUID,
 		Path:  "test",
 		Type:  "test",
@@ -828,8 +835,8 @@ func TestRequestHandling_DisallowAuthErrorTokenCreation(t *testing.T) {
 		t.Fatalf("err: %v", err)
 	}
 
-	core.credentialBackends["test"] = func(ctx context.Context, conf *logical.BackendConfig) (logical.Backend, error) {
-		return &NoopBackend{
+	core.credentialBackends["test"] = func(context.Context, *logical.BackendConfig) (logical.Backend, error) {
+		return &backendTest.Noop{
 			Login:       []string{"login"},
 			BackendType: logical.TypeCredential,
 			RequestHandler: func(context.Context, *logical.Request) (*logical.Response, error) {
@@ -883,7 +890,7 @@ func TestRequestHandling_CrossNamespaceRouting(t *testing.T) {
 
 	// Create a backend that always generates a new lease.
 	core.logicalBackends["test"] = func(context.Context, *logical.BackendConfig) (logical.Backend, error) {
-		return &NoopBackend{
+		return &backendTest.Noop{
 			BackendType: logical.TypeLogical,
 			Response: &logical.Response{
 				Secret: &logical.Secret{

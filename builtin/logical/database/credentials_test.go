@@ -4,7 +4,6 @@
 package database
 
 import (
-	"context"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
@@ -452,7 +451,8 @@ func Test_newRSAKeyGenerator(t *testing.T) {
 func Test_passwordGenerator_generate(t *testing.T) {
 	config := logical.TestBackendConfig()
 	b := Backend(config)
-	b.Setup(context.Background(), config)
+	err := b.Setup(t.Context(), config)
+	require.NoError(t, err)
 
 	type args struct {
 		config  map[string]interface{}
@@ -552,13 +552,14 @@ func Test_passwordGenerator_generate(t *testing.T) {
 
 			// Set the password policy for the test case
 			config.System.(*logical.StaticSystemView).SetPasswordPolicy(
-				"test-policy", tt.args.passGen)
+				"test-policy", tt.args.passGen,
+			)
 
 			// Generate the password
 			pg, err := newPasswordGenerator(tt.args.config)
 			require.NoError(t, err)
 
-			got, err := pg.generate(context.Background(), b, wrapper)
+			got, err := pg.generate(t.Context(), b, wrapper)
 			if tt.wantErr {
 				assert.Error(t, err)
 				return

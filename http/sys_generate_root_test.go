@@ -4,7 +4,6 @@
 package http
 
 import (
-	"context"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -218,7 +217,7 @@ func enableNoopAudit(t *testing.T, token string, core *vault.Core) {
 			"type": "noop",
 		},
 	}
-	resp, err := core.HandleRequest(namespace.RootContext(context.Background()), auditReq)
+	resp, err := core.HandleRequest(namespace.RootContext(t.Context()), auditReq)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -318,12 +317,12 @@ func TestSysGenerateRoot_Update_OTP(t *testing.T) {
 	if actual["encoded_token"] == nil || actual["encoded_token"] == "" {
 		t.Fatal("no encoded token found in response")
 	}
-	if actual["encoded_root_token"] == nil || actual["encoded_root-token"] == "" {
+	expected["encoded_token"] = actual["encoded_token"]
+
+	if actual["encoded_root_token"] == nil || actual["encoded_root_token"] == "" {
 		t.Fatal("no encoded root token found in response")
 	}
-	expected["encoded_token"] = actual["encoded_token"]
 	expected["encoded_root_token"] = actual["encoded_root_token"]
-	expected["encoded_token"] = actual["encoded_token"]
 
 	if !reflect.DeepEqual(actual, expected) {
 		t.Fatalf("\nexpected: %#v\nactual: %#v", expected, actual)
@@ -422,12 +421,12 @@ func TestSysGenerateRoot_Update_PGP(t *testing.T) {
 	if actual["encoded_token"] == nil || actual["encoded_token"] == "" {
 		t.Fatal("no encoded token found in response")
 	}
-	if actual["encoded_root_token"] == nil || actual["encoded_root-token"] == "" {
+	expected["encoded_token"] = actual["encoded_token"]
+
+	if actual["encoded_root_token"] == nil || actual["encoded_root_token"] == "" {
 		t.Fatal("no encoded root token found in response")
 	}
-	expected["encoded_token"] = actual["encoded_token"]
 	expected["encoded_root_token"] = actual["encoded_root_token"]
-	expected["encoded_token"] = actual["encoded_token"]
 
 	if !reflect.DeepEqual(actual, expected) {
 		t.Fatalf("\nexpected: %#v\nactual: %#v", expected, actual)

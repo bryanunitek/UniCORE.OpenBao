@@ -160,8 +160,6 @@ cKumubUxOfFdy1ZvAAAAEm5jY0BtYnAudWJudC5sb2NhbA==
 	dockerImageTagSupportsNoRSA1 = "8.4_p1-r3-ls48"
 )
 
-var ctx = context.Background()
-
 func prepareTestContainer(t *testing.T, tag, caPublicKeyPEM string) (func(), string) {
 	if tag == "" {
 		tag = dockerImageTagSupportsNoRSA1
@@ -182,7 +180,7 @@ func prepareTestContainer(t *testing.T, tag, caPublicKeyPEM string) (func(), str
 		t.Fatalf("Could not start local ssh docker container: %s", err)
 	}
 
-	svc, err := runner.StartService(context.Background(), func(ctx context.Context, host string, port int) (docker.ServiceConfig, error) {
+	svc, err := runner.StartService(t.Context(), func(ctx context.Context, host string, port int) (docker.ServiceConfig, error) {
 		ipaddr, err := net.ResolveIPAddr("ip", host)
 		if err != nil {
 			return nil, err
@@ -195,7 +193,7 @@ func prepareTestContainer(t *testing.T, tag, caPublicKeyPEM string) (func(), str
 		}
 
 		// Install util-linux for non-busybox flock that supports timeout option
-		err = testSSH("vaultssh", sshAddress, ssh.PublicKeys(signer), fmt.Sprintf(`
+		err = testSSH(testUserName, sshAddress, ssh.PublicKeys(signer), fmt.Sprintf(`
 			set -e;
 			sudo ln -s /config /home/vaultssh
 			sudo apk add util-linux;
@@ -257,7 +255,7 @@ func TestBackend_AllowedUsers(t *testing.T) {
 		Data:      roleData,
 	}
 
-	resp, err := b.HandleRequest(context.Background(), roleReq)
+	resp, err := b.HandleRequest(t.Context(), roleReq)
 	if err != nil || (resp != nil && resp.IsError()) || resp != nil {
 		t.Fatalf("failed to create role: resp:%#v err:%s", resp, err)
 	}
@@ -273,7 +271,7 @@ func TestBackend_AllowedUsers(t *testing.T) {
 		Data:      credsData,
 	}
 
-	resp, err = b.HandleRequest(context.Background(), credsReq)
+	resp, err = b.HandleRequest(t.Context(), credsReq)
 	if err != nil || (resp != nil && resp.IsError()) || resp == nil {
 		t.Fatalf("failed to create role: resp:%#v err:%s", resp, err)
 	}
@@ -285,7 +283,7 @@ func TestBackend_AllowedUsers(t *testing.T) {
 	}
 
 	credsData["username"] = "test"
-	resp, err = b.HandleRequest(context.Background(), credsReq)
+	resp, err = b.HandleRequest(t.Context(), credsReq)
 	if err != nil || (resp != nil && resp.IsError()) || resp == nil {
 		t.Fatalf("failed to create role: resp:%#v err:%s", resp, err)
 	}
@@ -297,19 +295,19 @@ func TestBackend_AllowedUsers(t *testing.T) {
 	}
 
 	credsData["username"] = "random"
-	resp, err = b.HandleRequest(context.Background(), credsReq)
+	resp, err = b.HandleRequest(t.Context(), credsReq)
 	if err != nil || resp == nil || !resp.IsError() {
 		t.Fatalf("expected failure: resp:%#v err:%s", resp, err)
 	}
 
 	delete(roleData, "allowed_users")
-	resp, err = b.HandleRequest(context.Background(), roleReq)
+	resp, err = b.HandleRequest(t.Context(), roleReq)
 	if err != nil || (resp != nil && resp.IsError()) || resp != nil {
 		t.Fatalf("failed to create role: resp:%#v err:%s", resp, err)
 	}
 
 	credsData["username"] = "ubuntu"
-	resp, err = b.HandleRequest(context.Background(), credsReq)
+	resp, err = b.HandleRequest(t.Context(), credsReq)
 	if err != nil || (resp != nil && resp.IsError()) || resp == nil {
 		t.Fatalf("failed to create role: resp:%#v err:%s", resp, err)
 	}
@@ -321,18 +319,18 @@ func TestBackend_AllowedUsers(t *testing.T) {
 	}
 
 	credsData["username"] = "test"
-	resp, err = b.HandleRequest(context.Background(), credsReq)
+	resp, err = b.HandleRequest(t.Context(), credsReq)
 	if err != nil || resp == nil || !resp.IsError() {
 		t.Fatalf("expected failure: resp:%#v err:%s", resp, err)
 	}
 
 	roleData["allowed_users"] = "*"
-	resp, err = b.HandleRequest(context.Background(), roleReq)
+	resp, err = b.HandleRequest(t.Context(), roleReq)
 	if err != nil || (resp != nil && resp.IsError()) || resp != nil {
 		t.Fatalf("failed to create role: resp:%#v err:%s", resp, err)
 	}
 
-	resp, err = b.HandleRequest(context.Background(), credsReq)
+	resp, err = b.HandleRequest(t.Context(), credsReq)
 	if err != nil || (resp != nil && resp.IsError()) || resp == nil {
 		t.Fatalf("failed to create role: resp:%#v err:%s", resp, err)
 	}
@@ -370,34 +368,41 @@ func TestBackend_AllowedDomainsTemplate(t *testing.T) {
 }
 
 func TestBackend_AllowedUsersTemplate(t *testing.T) {
-	testAllowedUsersTemplate(t,
+	testAllowedUsersTemplate(
+		t,
 		"{{ identity.entity.metadata.ssh_username }}",
 		testUserName, map[string]string{
 			"ssh_username": testUserName,
 		},
+		false,
 	)
 }
 
 func TestBackend_MultipleAllowedUsersTemplate(t *testing.T) {
-	testAllowedUsersTemplate(t,
+	testAllowedUsersTemplate(
+		t,
 		"{{ identity.entity.metadata.ssh_username }}",
 		testUserName, map[string]string{
 			"ssh_username": testMultiUserName,
 		},
+		true,
 	)
 }
 
 func TestBackend_AllowedUsersTemplate_WithStaticPrefix(t *testing.T) {
-	testAllowedUsersTemplate(t,
+	testAllowedUsersTemplate(
+		t,
 		"ssh-{{ identity.entity.metadata.ssh_username }}",
 		"ssh-"+testUserName, map[string]string{
 			"ssh_username": testUserName,
 		},
+		false,
 	)
 }
 
 func TestBackend_DefaultUserTemplate(t *testing.T) {
-	testDefaultUserTemplate(t,
+	testDefaultUserTemplate(
+		t,
 		"{{ identity.entity.metadata.ssh_username }}",
 		testUserName,
 		map[string]string{
@@ -407,13 +412,64 @@ func TestBackend_DefaultUserTemplate(t *testing.T) {
 }
 
 func TestBackend_DefaultUserTemplate_WithStaticPrefix(t *testing.T) {
-	testDefaultUserTemplate(t,
+	testDefaultUserTemplate(
+		t,
 		"user-{{ identity.entity.metadata.ssh_username }}",
 		"user-"+testUserName,
 		map[string]string{
 			"ssh_username": testUserName,
 		},
 	)
+}
+
+func TestBackend_ForbiddenCommaInTemplate(t *testing.T) {
+	cluster, userpassToken := getSshCaTestCluster(t, testUserName)
+	defer cluster.Cleanup()
+	client := cluster.Cores[0].Client
+
+	// set metadata "ssh_username" to userpass username
+	tokenLookupResponse, err := client.Logical().Write("/auth/token/lookup", map[string]interface{}{
+		"token": userpassToken,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	entityID := tokenLookupResponse.Data["entity_id"].(string)
+	_, err = client.Logical().Write("/identity/entity/id/"+entityID, map[string]interface{}{
+		"metadata": map[string]string{
+			"ssh_username": testMultiUserName,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = client.Logical().Write("ssh/roles/my-role", map[string]interface{}{
+		"key_type":                           testCaKeyType,
+		"allow_user_certificates":            true,
+		"default_user":                       "{{identity.entity.metadata.ssh_username}}",
+		"default_user_template":              true,
+		"allowed_users":                      "{{identity.entity.metadata.ssh_username}}",
+		"allowed_users_template":             true,
+		"allow_commas_in_identity_templates": false,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// sign SSH key as userpass user
+	client.SetToken(userpassToken)
+	_, err = client.Logical().Write("ssh/sign/my-role", map[string]interface{}{
+		"public_key": testCAPublicKey,
+	})
+	if err == nil {
+		t.Error("signing request should fail when default_user is not in the allowed_users list, because allowed_users_template is true and default_user_template is not")
+	}
+
+	expectedErrStr := `template '{{identity.entity.metadata.ssh_username}}' could not be rendered -> template substitution contains forbidden value ","`
+	if !strings.Contains(err.Error(), expectedErrStr) {
+		t.Errorf("expected error to include %q but it was: %q", expectedErrStr, err.Error())
+	}
 }
 
 func TestBackend_DefaultUserTemplateFalse_AllowedUsersTemplateTrue(t *testing.T) {
@@ -518,17 +574,20 @@ func TestBackend_DefaultUserTemplateFalse_AllowedUsersTemplateFalse(t *testing.T
 	}
 	actualPrincipals := parsedKey.(*ssh.Certificate).ValidPrincipals
 	if len(actualPrincipals) < 1 {
-		t.Fatalf("No ValidPrincipals returned: should have been %v",
+		t.Fatalf(
+			"No ValidPrincipals returned: should have been %v",
 			[]string{"{{identity.entity.metadata.ssh_username}}"},
 		)
 	}
 	if len(actualPrincipals) > 1 {
-		t.Errorf("incorrect number ValidPrincipals, expected only 1: %v should be %v",
+		t.Errorf(
+			"incorrect number ValidPrincipals, expected only 1: %v should be %v",
 			actualPrincipals, []string{"{{identity.entity.metadata.ssh_username}}"},
 		)
 	}
 	if actualPrincipals[0] != "{{identity.entity.metadata.ssh_username}}" {
-		t.Fatalf("incorrect ValidPrincipals: %v should be %v",
+		t.Fatalf(
+			"incorrect ValidPrincipals: %v should be %v",
 			actualPrincipals, []string{"{{identity.entity.metadata.ssh_username}}"},
 		)
 	}
@@ -538,7 +597,7 @@ func newTestingFactory(t *testing.T) func(ctx context.Context, conf *logical.Bac
 	return func(ctx context.Context, conf *logical.BackendConfig) (logical.Backend, error) {
 		defaultLeaseTTLVal := 2 * time.Minute
 		maxLeaseTTLVal := 10 * time.Minute
-		return Factory(context.Background(), &logical.BackendConfig{
+		return Factory(t.Context(), &logical.BackendConfig{
 			Logger:      corehelpers.NewTestLogger(t),
 			StorageView: &logical.InmemStorage{},
 			System: &logical.StaticSystemView{
@@ -648,11 +707,7 @@ func TestSSHBackend_OTPRoleCrud(t *testing.T) {
 
 func TestSSHBackend_OTPCreate(t *testing.T) {
 	cleanup, sshAddress := prepareTestContainer(t, "", "")
-	defer func() {
-		if !t.Failed() {
-			cleanup()
-		}
-	}()
+	defer cleanup()
 
 	host, port, err := net.SplitHostPort(sshAddress)
 	if err != nil {
@@ -1505,7 +1560,7 @@ func TestBackend_DefExtTemplatingEnabled(t *testing.T) {
 	invalidUserProvidedExtensionPermissions := map[string]string{
 		"login@foobar.com": "{{identity.entity.metadata}}",
 	}
-	resp, err = client.Logical().Write("ssh/sign/test", map[string]interface{}{
+	_, err = client.Logical().Write("ssh/sign/test", map[string]interface{}{
 		"public_key": publicKey4096,
 		"extensions": invalidUserProvidedExtensionPermissions,
 	})
@@ -1897,7 +1952,8 @@ func testDefaultUserTemplate(t *testing.T, testDefaultUserTemplate string,
 	}
 	actualPrincipals := parsedKey.(*ssh.Certificate).ValidPrincipals
 	if actualPrincipals[0] != expectedValidPrincipal {
-		t.Fatalf("incorrect ValidPrincipals: %v should be %v",
+		t.Fatalf(
+			"incorrect ValidPrincipals: %v should be %v",
 			actualPrincipals, []string{expectedValidPrincipal},
 		)
 	}
@@ -1947,7 +2003,8 @@ func testAllowedPrincipalsTemplate(t *testing.T, testAllowedDomainsTemplate stri
 	}
 	actualPrincipals := parsedKey.(*ssh.Certificate).ValidPrincipals
 	if actualPrincipals[0] != expectedValidPrincipal {
-		t.Fatalf("incorrect ValidPrincipals: %v should be %v",
+		t.Fatalf(
+			"incorrect ValidPrincipals: %v should be %v",
 			actualPrincipals, []string{expectedValidPrincipal},
 		)
 	}
@@ -1955,15 +2012,17 @@ func testAllowedPrincipalsTemplate(t *testing.T, testAllowedDomainsTemplate stri
 
 func testAllowedUsersTemplate(t *testing.T, testAllowedUsersTemplate string,
 	expectedValidPrincipal string, testEntityMetadata map[string]string,
+	allowCommasInIdentityTemplates bool,
 ) {
 	testAllowedPrincipalsTemplate(
 		t, testAllowedUsersTemplate,
 		expectedValidPrincipal, testEntityMetadata,
 		map[string]interface{}{
-			"key_type":                testCaKeyType,
-			"allow_user_certificates": true,
-			"allowed_users":           testAllowedUsersTemplate,
-			"allowed_users_template":  true,
+			"key_type":                           testCaKeyType,
+			"allow_user_certificates":            true,
+			"allowed_users":                      testAllowedUsersTemplate,
+			"allowed_users_template":             true,
+			"allow_commas_in_identity_templates": allowCommasInIdentityTemplates,
 		},
 		map[string]interface{}{
 			"public_key":       testCAPublicKey,
@@ -2334,7 +2393,7 @@ func TestBackend_CleanupDynamicHostKeys(t *testing.T) {
 		Storage:   s,
 	}
 
-	resp, err := b.HandleRequest(context.Background(), cleanRequest)
+	resp, err := b.HandleRequest(t.Context(), cleanRequest)
 	require.NoError(t, err)
 	require.NotNil(t, resp)
 	require.NotNil(t, resp.Data)
@@ -2342,19 +2401,19 @@ func TestBackend_CleanupDynamicHostKeys(t *testing.T) {
 	require.Contains(t, resp.Data["message"], "0 of 0")
 
 	// Write a bunch of bogus entries.
-	for i := 0; i < 15; i++ {
+	for i := range 15 {
 		data := map[string]interface{}{
 			"host": "localhost",
 			"key":  "nothing-to-see-here",
 		}
 		entry, err := logical.StorageEntryJSON(fmt.Sprintf("%vexample-%v", keysStoragePrefix, i), &data)
 		require.NoError(t, err)
-		err = s.Put(context.Background(), entry)
+		err = s.Put(t.Context(), entry)
 		require.NoError(t, err)
 	}
 
 	// Should now have 15
-	resp, err = b.HandleRequest(context.Background(), cleanRequest)
+	resp, err = b.HandleRequest(t.Context(), cleanRequest)
 	require.NoError(t, err)
 	require.NotNil(t, resp)
 	require.NotNil(t, resp.Data)
@@ -2362,7 +2421,7 @@ func TestBackend_CleanupDynamicHostKeys(t *testing.T) {
 	require.Contains(t, resp.Data["message"], "15 of 15")
 
 	// Should have none left.
-	resp, err = b.HandleRequest(context.Background(), cleanRequest)
+	resp, err = b.HandleRequest(t.Context(), cleanRequest)
 	require.NoError(t, err)
 	require.NotNil(t, resp)
 	require.NotNil(t, resp.Data)
@@ -2386,23 +2445,23 @@ func isDeniedOp(err error) bool {
 
 func pathShouldBeAuthed(t *testing.T, client *api.Client, path string, token string) {
 	client.SetToken("")
-	resp, err := client.Logical().ReadWithContext(ctx, path)
+	resp, err := client.Logical().ReadWithContext(t.Context(), path)
 	if err == nil || !isPermDenied(err) {
 		t.Fatalf("expected failure to read %v while unauthed: %v / %v", path, err, resp)
 	}
-	resp, err = client.Logical().ListWithContext(ctx, path)
+	resp, err = client.Logical().ListWithContext(t.Context(), path)
 	if err == nil || !isPermDenied(err) {
 		t.Fatalf("expected failure to list %v while unauthed: %v / %v", path, err, resp)
 	}
-	resp, err = client.Logical().WriteWithContext(ctx, path, map[string]interface{}{})
+	resp, err = client.Logical().WriteWithContext(t.Context(), path, map[string]interface{}{})
 	if err == nil || !isPermDenied(err) {
 		t.Fatalf("expected failure to write %v while unauthed: %v / %v", path, err, resp)
 	}
-	resp, err = client.Logical().DeleteWithContext(ctx, path)
+	resp, err = client.Logical().DeleteWithContext(t.Context(), path)
 	if err == nil || !isPermDenied(err) {
 		t.Fatalf("expected failure to delete %v while unauthed: %v / %v", path, err, resp)
 	}
-	resp, err = client.Logical().JSONMergePatch(ctx, path, map[string]interface{}{})
+	resp, err = client.Logical().JSONMergePatch(t.Context(), path, map[string]interface{}{})
 	if err == nil || !isPermDenied(err) {
 		t.Fatalf("expected failure to patch %v while unauthed: %v / %v", path, err, resp)
 	}
@@ -2411,23 +2470,23 @@ func pathShouldBeAuthed(t *testing.T, client *api.Client, path string, token str
 func pathShouldBeUnauthedReadList(t *testing.T, client *api.Client, path string, token string) {
 	// Should be able to read both with and without a token.
 	client.SetToken("")
-	resp, err := client.Logical().ReadWithContext(ctx, path)
+	resp, err := client.Logical().ReadWithContext(t.Context(), path)
 	if err != nil && isPermDenied(err) {
 		// Read will sometimes return permission denied, when the handler
 		// does not support the given operation. Retry with the token.
 		client.SetToken(token)
-		resp2, err2 := client.Logical().ReadWithContext(ctx, path)
+		resp2, err2 := client.Logical().ReadWithContext(t.Context(), path)
 		if err2 != nil && !isUnsupportedPathOperation(err2) {
 			t.Fatalf("unexpected failure to read %v while unauthed: %v / %v\nWhile authed: %v / %v", path, err, resp, err2, resp2)
 		}
 		client.SetToken("")
 	}
-	resp, err = client.Logical().ListWithContext(ctx, path)
+	resp, err = client.Logical().ListWithContext(t.Context(), path)
 	if err != nil && isPermDenied(err) {
 		// List will sometimes return permission denied, when the handler
 		// does not support the given operation. Retry with the token.
 		client.SetToken(token)
-		resp2, err2 := client.Logical().ListWithContext(ctx, path)
+		resp2, err2 := client.Logical().ListWithContext(t.Context(), path)
 		if err2 != nil && !isUnsupportedPathOperation(err2) {
 			t.Fatalf("unexpected failure to list %v while unauthed: %v / %v\nWhile authed: %v / %v", path, err, resp, err2, resp2)
 		}
@@ -2435,40 +2494,40 @@ func pathShouldBeUnauthedReadList(t *testing.T, client *api.Client, path string,
 	}
 
 	// These should all be denied.
-	resp, err = client.Logical().WriteWithContext(ctx, path, map[string]interface{}{})
+	resp, err = client.Logical().WriteWithContext(t.Context(), path, map[string]interface{}{})
 	if err == nil || !isDeniedOp(err) {
 		t.Fatalf("unexpected failure during write on read-only path %v while unauthed: %v / %v", path, err, resp)
 	}
-	resp, err = client.Logical().DeleteWithContext(ctx, path)
+	resp, err = client.Logical().DeleteWithContext(t.Context(), path)
 	if err == nil || !isDeniedOp(err) {
 		t.Fatalf("unexpected failure during delete on read-only path %v while unauthed: %v / %v", path, err, resp)
 	}
-	resp, err = client.Logical().JSONMergePatch(ctx, path, map[string]interface{}{})
+	resp, err = client.Logical().JSONMergePatch(t.Context(), path, map[string]interface{}{})
 	if err == nil || !isDeniedOp(err) {
 		t.Fatalf("unexpected failure during patch on read-only path %v while unauthed: %v / %v", path, err, resp)
 	}
 
 	// Retrying with token should allow read/list, but not modification still.
 	client.SetToken(token)
-	resp, err = client.Logical().ReadWithContext(ctx, path)
+	resp, err = client.Logical().ReadWithContext(t.Context(), path)
 	if err != nil && isPermDenied(err) {
 		t.Fatalf("unexpected failure to read %v while authed: %v / %v", path, err, resp)
 	}
-	resp, err = client.Logical().ListWithContext(ctx, path)
+	resp, err = client.Logical().ListWithContext(t.Context(), path)
 	if err != nil && isPermDenied(err) {
 		t.Fatalf("unexpected failure to list %v while authed: %v / %v", path, err, resp)
 	}
 
 	// Should all be denied.
-	resp, err = client.Logical().WriteWithContext(ctx, path, map[string]interface{}{})
+	resp, err = client.Logical().WriteWithContext(t.Context(), path, map[string]interface{}{})
 	if err == nil || !isDeniedOp(err) {
 		t.Fatalf("unexpected failure during write on read-only path %v while authed: %v / %v", path, err, resp)
 	}
-	resp, err = client.Logical().DeleteWithContext(ctx, path)
+	resp, err = client.Logical().DeleteWithContext(t.Context(), path)
 	if err == nil || !isDeniedOp(err) {
 		t.Fatalf("unexpected failure during delete on read-only path %v while authed: %v / %v", path, err, resp)
 	}
-	resp, err = client.Logical().JSONMergePatch(ctx, path, map[string]interface{}{})
+	resp, err = client.Logical().JSONMergePatch(t.Context(), path, map[string]interface{}{})
 	if err == nil || !isDeniedOp(err) {
 		t.Fatalf("unexpected failure during patch on read-only path %v while authed: %v / %v", path, err, resp)
 	}
@@ -2476,52 +2535,52 @@ func pathShouldBeUnauthedReadList(t *testing.T, client *api.Client, path string,
 
 func pathShouldBeUnauthedWriteOnly(t *testing.T, client *api.Client, path string, token string) {
 	client.SetToken("")
-	resp, err := client.Logical().WriteWithContext(ctx, path, map[string]interface{}{})
+	resp, err := client.Logical().WriteWithContext(t.Context(), path, map[string]interface{}{})
 	if err != nil && isPermDenied(err) {
 		t.Fatalf("unexpected failure to write %v while unauthed: %v / %v", path, err, resp)
 	}
 
 	// These should all be denied.
-	resp, err = client.Logical().ReadWithContext(ctx, path)
+	resp, err = client.Logical().ReadWithContext(t.Context(), path)
 	if err == nil || !isDeniedOp(err) {
 		t.Fatalf("unexpected failure during read on write-only path %v while unauthed: %v / %v", path, err, resp)
 	}
-	resp, err = client.Logical().ListWithContext(ctx, path)
+	resp, err = client.Logical().ListWithContext(t.Context(), path)
 	if err == nil || !isDeniedOp(err) {
 		t.Fatalf("unexpected failure during list on write-only path %v while unauthed: %v / %v", path, err, resp)
 	}
-	resp, err = client.Logical().DeleteWithContext(ctx, path)
+	resp, err = client.Logical().DeleteWithContext(t.Context(), path)
 	if err == nil || !isDeniedOp(err) {
 		t.Fatalf("unexpected failure during delete on write-only path %v while unauthed: %v / %v", path, err, resp)
 	}
-	resp, err = client.Logical().JSONMergePatch(ctx, path, map[string]interface{}{})
+	resp, err = client.Logical().JSONMergePatch(t.Context(), path, map[string]interface{}{})
 	if err == nil || !isDeniedOp(err) {
 		t.Fatalf("unexpected failure during patch on write-only path %v while unauthed: %v / %v", path, err, resp)
 	}
 
 	// Retrying with token should allow writing, but nothing else.
 	client.SetToken(token)
-	resp, err = client.Logical().WriteWithContext(ctx, path, map[string]interface{}{})
+	resp, err = client.Logical().WriteWithContext(t.Context(), path, map[string]interface{}{})
 	if err != nil && isPermDenied(err) {
 		t.Fatalf("unexpected failure to write %v while unauthed: %v / %v", path, err, resp)
 	}
 
 	// These should all be denied.
-	resp, err = client.Logical().ReadWithContext(ctx, path)
+	resp, err = client.Logical().ReadWithContext(t.Context(), path)
 	if err == nil || !isDeniedOp(err) {
 		t.Fatalf("unexpected failure during read on write-only path %v while authed: %v / %v", path, err, resp)
 	}
-	resp, err = client.Logical().ListWithContext(ctx, path)
+	resp, err = client.Logical().ListWithContext(t.Context(), path)
 	if err == nil || !isDeniedOp(err) {
 		if resp != nil || err != nil {
 			t.Fatalf("unexpected failure during list on write-only path %v while authed: %v / %v", path, err, resp)
 		}
 	}
-	resp, err = client.Logical().DeleteWithContext(ctx, path)
+	resp, err = client.Logical().DeleteWithContext(t.Context(), path)
 	if err == nil || !isDeniedOp(err) {
 		t.Fatalf("unexpected failure during delete on write-only path %v while authed: %v / %v", path, err, resp)
 	}
-	resp, err = client.Logical().JSONMergePatch(ctx, path, map[string]interface{}{})
+	resp, err = client.Logical().JSONMergePatch(t.Context(), path, map[string]interface{}{})
 	if err == nil || !isDeniedOp(err) {
 		t.Fatalf("unexpected failure during patch on write-only path %v while authed: %v / %v", path, err, resp)
 	}
@@ -2557,7 +2616,7 @@ func TestProperAuthing(t *testing.T) {
 	token := client.Token()
 
 	// Mount SSH.
-	err := client.Sys().MountWithContext(ctx, "ssh", &api.MountInput{
+	err := client.Sys().MountWithContext(t.Context(), "ssh", &api.MountInput{
 		Type: "ssh",
 		Config: api.MountConfigInput{
 			DefaultLeaseTTL: "16h",
@@ -2569,14 +2628,14 @@ func TestProperAuthing(t *testing.T) {
 	}
 
 	// Setup basic configuration.
-	_, err = client.Logical().WriteWithContext(ctx, "ssh/config/ca", map[string]interface{}{
+	_, err = client.Logical().WriteWithContext(t.Context(), "ssh/config/ca", map[string]interface{}{
 		"generate_signing_key": true,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	_, err = client.Logical().WriteWithContext(ctx, "ssh/roles/test-ca", map[string]interface{}{
+	_, err = client.Logical().WriteWithContext(t.Context(), "ssh/roles/test-ca", map[string]interface{}{
 		"key_type":                "ca",
 		"allow_user_certificates": true,
 		"allowed_users":           "*",
@@ -2585,14 +2644,14 @@ func TestProperAuthing(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	_, err = client.Logical().WriteWithContext(ctx, "ssh/issue/test-ca", map[string]interface{}{
+	_, err = client.Logical().WriteWithContext(t.Context(), "ssh/issue/test-ca", map[string]interface{}{
 		"valid_principals": "toor",
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	_, err = client.Logical().WriteWithContext(ctx, "ssh/roles/test-ca-empty", map[string]interface{}{
+	_, err = client.Logical().WriteWithContext(t.Context(), "ssh/roles/test-ca-empty", map[string]interface{}{
 		"key_type":                "ca",
 		"allow_host_certificates": true,
 		"allow_empty_principals":  true,
@@ -2601,7 +2660,7 @@ func TestProperAuthing(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	_, err = client.Logical().WriteWithContext(ctx, "ssh/issue/test-ca-empty", map[string]interface{}{
+	_, err = client.Logical().WriteWithContext(t.Context(), "ssh/issue/test-ca-empty", map[string]interface{}{
 		"cert_type": "host",
 		"key_type":  "ssh-ed25519",
 	})
@@ -2609,7 +2668,7 @@ func TestProperAuthing(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	_, err = client.Logical().WriteWithContext(ctx, "ssh/roles/test-otp", map[string]interface{}{
+	_, err = client.Logical().WriteWithContext(t.Context(), "ssh/roles/test-otp", map[string]interface{}{
 		"key_type":     "otp",
 		"default_user": "toor",
 		"cidr_list":    "127.0.0.0/24",
@@ -2618,7 +2677,7 @@ func TestProperAuthing(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	resp, err := client.Logical().WriteWithContext(ctx, "ssh/creds/test-otp", map[string]interface{}{
+	resp, err := client.Logical().WriteWithContext(t.Context(), "ssh/creds/test-otp", map[string]interface{}{
 		"username": "toor",
 		"ip":       "127.0.0.1",
 	})
@@ -2653,7 +2712,7 @@ func TestProperAuthing(t *testing.T) {
 	}
 
 	client.SetToken(token)
-	openAPIResp, err := client.Logical().ReadWithContext(ctx, "sys/internal/specs/openapi")
+	openAPIResp, err := client.Logical().ReadWithContext(t.Context(), "sys/internal/specs/openapi")
 	if err != nil {
 		t.Fatalf("failed to get openapi data: %v", err)
 	}
@@ -2720,7 +2779,7 @@ func TestSSHBackend_IssuerLifecycle(t *testing.T) {
 	// Test initial state
 	t.Run("initial_state", func(t *testing.T) {
 		// Reading default issuer should fail when none configured
-		resp, err := b.HandleRequest(context.Background(), &logical.Request{
+		resp, err := b.HandleRequest(t.Context(), &logical.Request{
 			Operation: logical.ReadOperation,
 			Path:      "config/issuers",
 			Storage:   s,
@@ -2732,7 +2791,7 @@ func TestSSHBackend_IssuerLifecycle(t *testing.T) {
 	// Test issuer creation and default behavior
 	t.Run("creation_and_default", func(t *testing.T) {
 		// Create first issuer - should become default automatically
-		resp, err := b.HandleRequest(context.Background(), &logical.Request{
+		resp, err := b.HandleRequest(t.Context(), &logical.Request{
 			Operation: logical.UpdateOperation,
 			Path:      "issuers/import/first-issuer",
 			Storage:   s,
@@ -2742,7 +2801,7 @@ func TestSSHBackend_IssuerLifecycle(t *testing.T) {
 		firstIssuerId := resp.Data["issuer_id"].(string)
 
 		// Verify it's set as default
-		resp, err = b.HandleRequest(context.Background(), &logical.Request{
+		resp, err = b.HandleRequest(t.Context(), &logical.Request{
 			Operation: logical.ReadOperation,
 			Path:      "config/issuers",
 			Storage:   s,
@@ -2752,7 +2811,7 @@ func TestSSHBackend_IssuerLifecycle(t *testing.T) {
 		require.Equal(t, firstIssuerId, resp.Data["default"])
 
 		// Create second issuer with explicit default setting
-		resp, err = b.HandleRequest(context.Background(), &logical.Request{
+		resp, err = b.HandleRequest(t.Context(), &logical.Request{
 			Operation: logical.UpdateOperation,
 			Path:      "issuers/import/second-issuer",
 			Data: map[string]interface{}{
@@ -2765,7 +2824,7 @@ func TestSSHBackend_IssuerLifecycle(t *testing.T) {
 		secondIssuerId := resp.Data["issuer_id"].(string)
 
 		// Verify second issuer is now default
-		resp, err = b.HandleRequest(context.Background(), &logical.Request{
+		resp, err = b.HandleRequest(t.Context(), &logical.Request{
 			Operation: logical.ReadOperation,
 			Path:      "config/issuers",
 			Storage:   s,
@@ -2778,7 +2837,7 @@ func TestSSHBackend_IssuerLifecycle(t *testing.T) {
 	// Test issuer name conflicts
 	t.Run("issuer_name_conflicts", func(t *testing.T) {
 		// Create first issuer with name
-		resp, err := b.HandleRequest(context.Background(), &logical.Request{
+		resp, err := b.HandleRequest(t.Context(), &logical.Request{
 			Operation: logical.UpdateOperation,
 			Path:      "issuers/import/test-name",
 			Storage:   s,
@@ -2787,7 +2846,7 @@ func TestSSHBackend_IssuerLifecycle(t *testing.T) {
 		require.NotNil(t, resp)
 
 		// Try to create second issuer with same name
-		resp, err = b.HandleRequest(context.Background(), &logical.Request{
+		resp, err = b.HandleRequest(t.Context(), &logical.Request{
 			Operation: logical.UpdateOperation,
 			Path:      "issuers/import/test-name",
 			Storage:   s,
@@ -2801,7 +2860,7 @@ func TestSSHBackend_IssuerLifecycle(t *testing.T) {
 	t.Run("name_update", func(t *testing.T) {
 		// Create test issuer
 		issuerName := "test-issuer-name"
-		resp, err := b.HandleRequest(context.Background(), &logical.Request{
+		resp, err := b.HandleRequest(t.Context(), &logical.Request{
 			Operation: logical.UpdateOperation,
 			Path:      "issuers/import/" + issuerName,
 			Storage:   s,
@@ -2812,7 +2871,7 @@ func TestSSHBackend_IssuerLifecycle(t *testing.T) {
 
 		// Test name update
 		newName := "updated-name"
-		resp, err = b.HandleRequest(context.Background(), &logical.Request{
+		resp, err = b.HandleRequest(t.Context(), &logical.Request{
 			Operation: logical.UpdateOperation,
 			Path:      "issuer/" + issuerId,
 			Data: map[string]interface{}{
@@ -2824,7 +2883,7 @@ func TestSSHBackend_IssuerLifecycle(t *testing.T) {
 		require.NotNil(t, resp)
 
 		// Verify old name fails and new name works
-		resp, err = b.HandleRequest(context.Background(), &logical.Request{
+		resp, err = b.HandleRequest(t.Context(), &logical.Request{
 			Operation: logical.ReadOperation,
 			Path:      "issuer/" + issuerName,
 			Storage:   s,
@@ -2832,7 +2891,7 @@ func TestSSHBackend_IssuerLifecycle(t *testing.T) {
 		require.NoError(t, err)
 		require.True(t, resp.IsError())
 
-		resp, err = b.HandleRequest(context.Background(), &logical.Request{
+		resp, err = b.HandleRequest(t.Context(), &logical.Request{
 			Operation: logical.ReadOperation,
 			Path:      "issuer/" + newName,
 			Storage:   s,
@@ -2845,7 +2904,7 @@ func TestSSHBackend_IssuerLifecycle(t *testing.T) {
 	// Test public key operations
 	t.Run("public_key_operations", func(t *testing.T) {
 		// Create issuer with known key material
-		resp, err := b.HandleRequest(context.Background(), &logical.Request{
+		resp, err := b.HandleRequest(t.Context(), &logical.Request{
 			Operation: logical.UpdateOperation,
 			Path:      "config/ca",
 			Data: map[string]interface{}{
@@ -2859,7 +2918,7 @@ func TestSSHBackend_IssuerLifecycle(t *testing.T) {
 		issuerId := resp.Data["issuer_id"].(string)
 
 		// Test authenticated public key retrieval
-		resp, err = b.HandleRequest(context.Background(), &logical.Request{
+		resp, err = b.HandleRequest(t.Context(), &logical.Request{
 			Operation: logical.ReadOperation,
 			Path:      "issuer/" + issuerId,
 			Storage:   s,
@@ -2869,7 +2928,7 @@ func TestSSHBackend_IssuerLifecycle(t *testing.T) {
 		require.Equal(t, testCAPublicKey, resp.Data["public_key"])
 
 		// Test unauthenticated public key retrieval
-		resp, err = b.HandleRequest(context.Background(), &logical.Request{
+		resp, err = b.HandleRequest(t.Context(), &logical.Request{
 			Operation: logical.ReadOperation,
 			Path:      "issuer/" + issuerId + "/public_key",
 			Storage:   s,
@@ -2882,7 +2941,7 @@ func TestSSHBackend_IssuerLifecycle(t *testing.T) {
 	// Test deletion and cleanup
 	t.Run("deletion_and_cleanup", func(t *testing.T) {
 		// Create test issuer
-		resp, err := b.HandleRequest(context.Background(), &logical.Request{
+		resp, err := b.HandleRequest(t.Context(), &logical.Request{
 			Operation: logical.UpdateOperation,
 			Path:      "issuers/import/delete-test",
 			Storage:   s,
@@ -2892,7 +2951,7 @@ func TestSSHBackend_IssuerLifecycle(t *testing.T) {
 		issuerId := resp.Data["issuer_id"].(string)
 
 		// Delete the issuer
-		resp, err = b.HandleRequest(context.Background(), &logical.Request{
+		_, err = b.HandleRequest(t.Context(), &logical.Request{
 			Operation: logical.DeleteOperation,
 			Path:      "issuer/" + issuerId,
 			Storage:   s,
@@ -2900,7 +2959,7 @@ func TestSSHBackend_IssuerLifecycle(t *testing.T) {
 		require.NoError(t, err)
 
 		// Verify issuer is gone
-		resp, err = b.HandleRequest(context.Background(), &logical.Request{
+		resp, err = b.HandleRequest(t.Context(), &logical.Request{
 			Operation: logical.ReadOperation,
 			Path:      "issuer/" + issuerId,
 			Storage:   s,
@@ -2909,7 +2968,7 @@ func TestSSHBackend_IssuerLifecycle(t *testing.T) {
 		require.True(t, resp.IsError())
 
 		// Test bulk deletion via config/ca
-		resp, err = b.HandleRequest(context.Background(), &logical.Request{
+		_, err = b.HandleRequest(t.Context(), &logical.Request{
 			Operation: logical.DeleteOperation,
 			Path:      "config/ca",
 			Storage:   s,
@@ -2917,7 +2976,7 @@ func TestSSHBackend_IssuerLifecycle(t *testing.T) {
 		require.NoError(t, err)
 
 		// Verify all issuers are gone
-		resp, err = b.HandleRequest(context.Background(), &logical.Request{
+		resp, err = b.HandleRequest(t.Context(), &logical.Request{
 			Operation: logical.ListOperation,
 			Path:      "issuers",
 			Storage:   s,
@@ -2926,7 +2985,7 @@ func TestSSHBackend_IssuerLifecycle(t *testing.T) {
 		require.Empty(t, resp.Data["keys"])
 
 		// Verify that there's no default issuer configured
-		resp, err = b.HandleRequest(context.Background(), &logical.Request{
+		resp, err = b.HandleRequest(t.Context(), &logical.Request{
 			Operation: logical.ReadOperation,
 			Path:      "config/issuers",
 			Storage:   s,
@@ -2938,7 +2997,7 @@ func TestSSHBackend_IssuerLifecycle(t *testing.T) {
 	t.Run("issuer_reference_resolution", func(t *testing.T) {
 		// Create issuer with name
 		issuerName := "ref-test"
-		resp, err := b.HandleRequest(context.Background(), &logical.Request{
+		resp, err := b.HandleRequest(t.Context(), &logical.Request{
 			Operation: logical.UpdateOperation,
 			Path:      "issuers/import/" + issuerName,
 			Storage:   s,
@@ -2948,7 +3007,7 @@ func TestSSHBackend_IssuerLifecycle(t *testing.T) {
 		issuerID := resp.Data["issuer_id"].(string)
 
 		// Test referencing by ID
-		resp, err = b.HandleRequest(context.Background(), &logical.Request{
+		resp, err = b.HandleRequest(t.Context(), &logical.Request{
 			Operation: logical.ReadOperation,
 			Path:      "issuer/" + issuerID,
 			Storage:   s,
@@ -2957,7 +3016,7 @@ func TestSSHBackend_IssuerLifecycle(t *testing.T) {
 		require.NotNil(t, resp)
 
 		// Test referencing by name
-		resp, err = b.HandleRequest(context.Background(), &logical.Request{
+		resp, err = b.HandleRequest(t.Context(), &logical.Request{
 			Operation: logical.ReadOperation,
 			Path:      "issuer/" + issuerName,
 			Storage:   s,
@@ -2974,10 +3033,10 @@ func TestSSHBackend_IssuerLifecycle(t *testing.T) {
 			},
 			Storage: s,
 		}
-		resp, err = b.HandleRequest(context.Background(), updateReq)
+		_, err = b.HandleRequest(t.Context(), updateReq)
 		require.NoError(t, err)
 
-		resp, err = b.HandleRequest(context.Background(), &logical.Request{
+		resp, err = b.HandleRequest(t.Context(), &logical.Request{
 			Operation: logical.ReadOperation,
 			Path:      "issuer/default",
 			Storage:   s,
@@ -2997,7 +3056,7 @@ func TestSSHBackend_IssuerLifecycle(t *testing.T) {
 			},
 			Storage: s,
 		}
-		resp, err := b.HandleRequest(context.Background(), req)
+		resp, err := b.HandleRequest(t.Context(), req)
 		require.NoError(t, err)
 		require.NotNil(t, resp)
 		require.NotNil(t, resp.Data)
@@ -3017,7 +3076,7 @@ func TestSSHBackend_IssuerLifecycle(t *testing.T) {
 			},
 			Storage: s,
 		}
-		resp, err = b.HandleRequest(context.Background(), req)
+		resp, err = b.HandleRequest(t.Context(), req)
 		require.NoError(t, err)
 		require.NotNil(t, resp)
 		require.NotNil(t, resp.Data)
@@ -3051,7 +3110,7 @@ func TestSSHBackend_BasicIssuerOperations(t *testing.T) {
 		},
 		Storage: s,
 	}
-	resp, err := b.HandleRequest(context.Background(), roleReq)
+	resp, err := b.HandleRequest(t.Context(), roleReq)
 	if err != nil || (resp != nil && resp.IsError()) {
 		t.Fatalf("cannot create role, got resp: %+v, err: %v", resp, err)
 	}
@@ -3066,7 +3125,7 @@ func TestSSHBackend_BasicIssuerOperations(t *testing.T) {
 		},
 		Storage: s,
 	}
-	resp, err = b.HandleRequest(context.Background(), signReq)
+	resp, err = b.HandleRequest(t.Context(), signReq)
 	if err != nil || (resp != nil && !resp.IsError()) {
 		t.Fatalf("expected key signing to have failed as no issuer is configured, got resp: %+v, err: %v", resp, err)
 	}
@@ -3078,7 +3137,7 @@ func TestSSHBackend_BasicIssuerOperations(t *testing.T) {
 		Path:      "issuers/import",
 		Storage:   s,
 	}
-	resp, err = b.HandleRequest(context.Background(), importIssuerReq)
+	resp, err = b.HandleRequest(t.Context(), importIssuerReq)
 	if err != nil || (resp != nil && resp.IsError()) {
 		t.Fatalf("cannot create issuer, got: resp: %+v, err: %v", resp, err)
 	}
@@ -3094,7 +3153,7 @@ func TestSSHBackend_BasicIssuerOperations(t *testing.T) {
 	defer cleanup()
 
 	// try to sign a key with the role, should succeed as there is an issuer configured as default
-	resp, err = b.HandleRequest(context.Background(), signReq)
+	resp, err = b.HandleRequest(t.Context(), signReq)
 	if err != nil || (resp != nil && resp.IsError()) {
 		t.Fatalf("expected key sign to succeed, got resp: %+v, err: %v", resp, err)
 	}
@@ -3145,7 +3204,7 @@ func TestSSHBackend_DefaultIssuerBehavior(t *testing.T) {
 		},
 		Storage: s,
 	}
-	resp, err := b.HandleRequest(context.Background(), importIssuerReq)
+	resp, err := b.HandleRequest(t.Context(), importIssuerReq)
 	if err != nil || (resp != nil && resp.IsError()) {
 		t.Fatalf("ca issuer should have been successfully submited, got: resp: %+v, err: %v", resp, err)
 	}
@@ -3159,7 +3218,7 @@ func TestSSHBackend_DefaultIssuerBehavior(t *testing.T) {
 		},
 		Storage: s,
 	}
-	resp, err = b.HandleRequest(context.Background(), issueReq)
+	resp, err = b.HandleRequest(t.Context(), issueReq)
 	if err != nil || (resp != nil && resp.IsError()) {
 		t.Fatalf("expected key issue to succeed, got resp: %+v, err: %v", resp, err)
 	}
@@ -3216,7 +3275,7 @@ func TestSSHBackend_RoleIssuerBinding(t *testing.T) {
 			},
 			Storage: s,
 		}
-		resp, err := b.HandleRequest(context.Background(), issuer1Req)
+		resp, err := b.HandleRequest(t.Context(), issuer1Req)
 		require.NoError(t, err)
 		require.NotNil(t, resp)
 		issuer1ID := resp.Data["issuer_id"].(string)
@@ -3227,7 +3286,7 @@ func TestSSHBackend_RoleIssuerBinding(t *testing.T) {
 			Path:      "issuers/import/issuer2",
 			Storage:   s,
 		}
-		resp, err = b.HandleRequest(context.Background(), issuer2Req)
+		resp, err = b.HandleRequest(t.Context(), issuer2Req)
 		require.NoError(t, err)
 		require.NotNil(t, resp)
 		issuer2ID := resp.Data["issuer_id"].(string)
@@ -3249,12 +3308,12 @@ func TestSSHBackend_RoleIssuerBinding(t *testing.T) {
 			},
 			Storage: s,
 		}
-		resp, err = b.HandleRequest(context.Background(), role1Req)
+		resp, err = b.HandleRequest(t.Context(), role1Req)
 		require.NoError(t, err)
 		require.Nil(t, resp)
 
 		// Verify role correctly stores issuer reference
-		resp, err = b.HandleRequest(context.Background(), &logical.Request{
+		resp, err = b.HandleRequest(t.Context(), &logical.Request{
 			Operation: logical.ReadOperation,
 			Path:      "roles/" + role1Name,
 			Storage:   s,
@@ -3273,7 +3332,7 @@ func TestSSHBackend_RoleIssuerBinding(t *testing.T) {
 			},
 			Storage: s,
 		}
-		resp, err = b.HandleRequest(context.Background(), signReq)
+		resp, err = b.HandleRequest(t.Context(), signReq)
 		require.NoError(t, err)
 		require.NotNil(t, resp)
 		require.NotEmpty(t, resp.Data["signed_key"])
@@ -3286,7 +3345,7 @@ func TestSSHBackend_RoleIssuerBinding(t *testing.T) {
 			Path:      "issuers/import/test-issuer",
 			Storage:   s,
 		}
-		resp, err := b.HandleRequest(context.Background(), issuerReq)
+		resp, err := b.HandleRequest(t.Context(), issuerReq)
 		require.NoError(t, err)
 		require.NotNil(t, resp)
 		issuerID := resp.Data["issuer_id"].(string)
@@ -3305,7 +3364,7 @@ func TestSSHBackend_RoleIssuerBinding(t *testing.T) {
 			},
 			Storage: s,
 		}
-		resp, err = b.HandleRequest(context.Background(), roleReq)
+		resp, err = b.HandleRequest(t.Context(), roleReq)
 		require.NoError(t, err)
 		require.Nil(t, resp)
 
@@ -3319,7 +3378,7 @@ func TestSSHBackend_RoleIssuerBinding(t *testing.T) {
 			},
 			Storage: s,
 		}
-		resp, err = b.HandleRequest(context.Background(), signReq)
+		resp, err = b.HandleRequest(t.Context(), signReq)
 		require.NoError(t, err)
 		require.NotNil(t, resp)
 		require.NotEmpty(t, resp.Data["signed_key"])
@@ -3330,20 +3389,20 @@ func TestSSHBackend_RoleIssuerBinding(t *testing.T) {
 			Path:      "issuer/" + issuerID,
 			Storage:   s,
 		}
-		resp, err = b.HandleRequest(context.Background(), deleteReq)
+		resp, err = b.HandleRequest(t.Context(), deleteReq)
 		require.NoError(t, err)
 		// Response should contain warning about role references
 		require.NotNil(t, resp)
 		require.Contains(t, resp.Warnings[0], "1 roles reference")
 
 		// Verify signing now fails
-		resp, err = b.HandleRequest(context.Background(), signReq)
+		resp, err = b.HandleRequest(t.Context(), signReq)
 		require.NoError(t, err)
 		require.True(t, resp.IsError())
 		require.Contains(t, resp.Error().Error(), fmt.Sprintf("unable to find issuer for reference: %s", issuerID))
 
 		// Verify role still exists but shows invalid issuer
-		resp, err = b.HandleRequest(context.Background(), &logical.Request{
+		resp, err = b.HandleRequest(t.Context(), &logical.Request{
 			Operation: logical.ReadOperation,
 			Path:      "roles/" + roleName,
 			Storage:   s,
@@ -3360,7 +3419,7 @@ func TestSSHBackend_RoleIssuerBinding(t *testing.T) {
 			Path:      "issuers/import/issuer3",
 			Storage:   s,
 		}
-		resp, err := b.HandleRequest(context.Background(), issuer3Req)
+		resp, err := b.HandleRequest(t.Context(), issuer3Req)
 		require.NoError(t, err)
 		require.NotNil(t, resp)
 		issuer3ID := resp.Data["issuer_id"].(string)
@@ -3370,7 +3429,7 @@ func TestSSHBackend_RoleIssuerBinding(t *testing.T) {
 			Path:      "issuers/import/issuer4",
 			Storage:   s,
 		}
-		resp, err = b.HandleRequest(context.Background(), issuer4Req)
+		resp, err = b.HandleRequest(t.Context(), issuer4Req)
 		require.NoError(t, err)
 		require.NotNil(t, resp)
 		issuer4ID := resp.Data["issuer_id"].(string)
@@ -3390,18 +3449,18 @@ func TestSSHBackend_RoleIssuerBinding(t *testing.T) {
 			},
 			Storage: s,
 		}
-		resp, err = b.HandleRequest(context.Background(), roleReq)
+		resp, err = b.HandleRequest(t.Context(), roleReq)
 		require.NoError(t, err)
 		require.Nil(t, resp)
 
 		// Update role to use issuer4
 		roleReq.Data["issuer_ref"] = issuer4ID
-		resp, err = b.HandleRequest(context.Background(), roleReq)
+		resp, err = b.HandleRequest(t.Context(), roleReq)
 		require.NoError(t, err)
 		require.Nil(t, resp)
 
 		// Verify role now uses issuer4
-		resp, err = b.HandleRequest(context.Background(), &logical.Request{
+		resp, err = b.HandleRequest(t.Context(), &logical.Request{
 			Operation: logical.ReadOperation,
 			Path:      "roles/" + roleName,
 			Storage:   s,
@@ -3426,7 +3485,7 @@ func setupInitialIssuerAndRole(t *testing.T, b *backend, s logical.Storage, role
 		},
 		Storage: s,
 	}
-	resp, err := b.HandleRequest(context.Background(), roleReq)
+	resp, err := b.HandleRequest(t.Context(), roleReq)
 	if err != nil || (resp != nil && resp.IsError()) {
 		t.Fatalf("cannot create role, got resp: %+v, err: %v", resp, err)
 	}
@@ -3436,7 +3495,7 @@ func setupInitialIssuerAndRole(t *testing.T, b *backend, s logical.Storage, role
 		Path:      "issuers/import",
 		Storage:   s,
 	}
-	resp, err = b.HandleRequest(context.Background(), importIssuerReq)
+	resp, err = b.HandleRequest(t.Context(), importIssuerReq)
 	if err != nil || (resp != nil && resp.IsError()) {
 		t.Fatalf("cannot create issuer, got: resp: %+v, err: %v", resp, err)
 	}
@@ -3451,7 +3510,7 @@ func CreateBackendWithStorage(t testing.TB) (*backend, logical.Storage) {
 	b, err := Backend(config)
 	require.NoError(t, err, "cannot create backend")
 
-	err = b.Setup(context.Background(), config)
+	err = b.Setup(t.Context(), config)
 	require.NoError(t, err, "cannot setup backend")
 
 	return b, config.StorageView

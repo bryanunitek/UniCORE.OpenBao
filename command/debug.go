@@ -8,6 +8,7 @@ import (
 	"compress/gzip"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -23,7 +24,6 @@ import (
 
 	"github.com/hashicorp/cli"
 	"github.com/hashicorp/go-hclog"
-	"github.com/hashicorp/go-secure-stdlib/gatedwriter"
 	"github.com/hashicorp/go-secure-stdlib/strutil"
 	"github.com/oklog/run"
 	"github.com/openbao/openbao/api/v2"
@@ -247,10 +247,8 @@ func (c *DebugCommand) Run(args []string) int {
 		return 1
 	}
 
-	// Initialize the logger for debug output
-	gatedWriter := gatedwriter.NewWriter(os.Stderr)
 	if c.logger == nil {
-		c.logger = logging.NewVaultLoggerWithWriter(gatedWriter, hclog.Trace)
+		c.logger = logging.NewVaultLoggerWithWriter(os.Stderr, hclog.Trace)
 	}
 
 	dstOutputFile, err := c.preflight(args)
@@ -269,29 +267,24 @@ func (c *DebugCommand) Run(args []string) int {
 	c.UI.Info(fmt.Sprintf("      Metrics Interval: %s", c.flagMetricsInterval))
 	c.UI.Info(fmt.Sprintf("               Targets: %s", strings.Join(c.flagTargets, ", ")))
 	c.UI.Info(fmt.Sprintf("                Output: %s", dstOutputFile))
-	c.UI.Output("")
-
-	// Release the log gate.
-	c.logger.(hclog.OutputResettable).ResetOutputWithFlush(&hclog.LoggerOptions{
-		Output: os.Stderr,
-	}, gatedWriter)
 
 	// Capture static information
+	c.UI.Output("")
 	c.UI.Info("==> Capturing static information...")
 	if err := c.captureStaticTargets(); err != nil {
 		c.UI.Error(fmt.Sprintf("Error capturing static information: %s", err))
 		return 2
 	}
 
-	c.UI.Output("")
-
 	// Capture polling information
+	c.UI.Output("")
 	c.UI.Info("==> Capturing dynamic information...")
 	if err := c.capturePollingTargets(); err != nil {
 		c.UI.Error(fmt.Sprintf("Error capturing dynamic information: %s", err))
 		return 2
 	}
 
+	c.UI.Output("")
 	c.UI.Output("Finished capturing information, bundling files...")
 
 	// Generate index file
@@ -676,7 +669,7 @@ func (c *DebugCommand) collectHostInfo(ctx context.Context) {
 			return
 		}
 		if resp != nil {
-			defer resp.Body.Close()
+			defer resp.Body.Close() //nolint:errcheck
 
 			secret, err := api.ParseSecret(resp.Body)
 			if err != nil {
@@ -714,7 +707,7 @@ func (c *DebugCommand) collectMetrics(ctx context.Context) {
 			continue
 		}
 		if resp != nil {
-			defer resp.Body.Close()
+			defer resp.Body.Close() //nolint:errcheck
 
 			metricsEntry := make(map[string]interface{})
 			err := json.NewDecoder(resp.Body).Decode(&metricsEntry)
@@ -774,9 +767,7 @@ func (c *DebugCommand) collectPprof(ctx context.Context) {
 
 		// As a convenience, we'll also fetch the goroutine target using debug=2, which yields a text
 		// version of the stack traces that don't require using `go tool pprof` to view.
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			data, err := pprofTarget(ctx, c.cachedClient, "goroutine", url.Values{"debug": []string{"2"}})
 			if err != nil {
 				c.captureError("pprof.goroutines-text", err)
@@ -787,7 +778,7 @@ func (c *DebugCommand) collectPprof(ctx context.Context) {
 			if err != nil {
 				c.captureError("pprof.goroutines-text", err)
 			}
-		}()
+		})
 
 		// If the our remaining duration is less than the interval value
 		// skip profile and trace.
@@ -798,9 +789,7 @@ func (c *DebugCommand) collectPprof(ctx context.Context) {
 		}
 
 		// Capture profile
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			data, err := pprofProfile(ctx, c.cachedClient, c.flagInterval)
 			if err != nil {
 				c.captureError("pprof.profile", err)
@@ -811,12 +800,10 @@ func (c *DebugCommand) collectPprof(ctx context.Context) {
 			if err != nil {
 				c.captureError("pprof.profile", err)
 			}
-		}()
+		})
 
 		// Capture trace
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			data, err := pprofTrace(ctx, c.cachedClient, c.flagInterval)
 			if err != nil {
 				c.captureError("pprof.trace", err)
@@ -827,7 +814,7 @@ func (c *DebugCommand) collectPprof(ctx context.Context) {
 			if err != nil {
 				c.captureError("pprof.trace", err)
 			}
-		}()
+		})
 
 		wg.Wait()
 	}
@@ -855,7 +842,7 @@ func (c *DebugCommand) collectReplicationStatus(ctx context.Context) {
 			return
 		}
 		if resp != nil {
-			defer resp.Body.Close()
+			defer resp.Body.Close() //nolint:errcheck
 
 			secret, err := api.ParseSecret(resp.Body)
 			if err != nil {
@@ -929,7 +916,7 @@ func (c *DebugCommand) collectInFlightRequestStatus(ctx context.Context) {
 
 		var data map[string]interface{}
 		if resp != nil {
-			defer resp.Body.Close()
+			defer resp.Body.Close() //nolint:errcheck
 			err = jsonutil.DecodeJSONFromReader(resp.Body, &data)
 			if err != nil {
 				c.captureError("requests", err)
@@ -971,24 +958,30 @@ func (c *DebugCommand) compress(dst string) error {
 
 	// Do this in a sub-function so we validate close works prior to
 	// removing the output, while letting us keep using defer.
-	if err := func() error {
+	if err := func() (err error) {
 		output, err := os.OpenFile(dst, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
 		if err != nil {
 			return fmt.Errorf("failed to open output archive for writing: %w", err)
 		}
-		defer output.Close()
+		defer func() {
+			err = errors.Join(err, output.Close())
+		}()
 
 		gzipped := gzip.NewWriter(output)
-		defer gzipped.Close()
+		defer func() {
+			err = errors.Join(err, gzipped.Close())
+		}()
 
 		archive := tar.NewWriter(gzipped)
-		defer archive.Close()
+		defer func() {
+			err = errors.Join(err, archive.Close())
+		}()
 
 		parent := filepath.Dir(c.flagOutput)
 		child := filepath.Base(c.flagOutput)
 
 		ofs := os.DirFS(parent)
-		if err := fs.WalkDir(ofs, child, func(path string, d fs.DirEntry, err error) error {
+		if err := fs.WalkDir(ofs, child, func(path string, d fs.DirEntry, _ error) error {
 			var fileType byte = tar.TypeReg
 			tarPath := path
 			if d.IsDir() {
@@ -1054,7 +1047,7 @@ func pprofTarget(ctx context.Context, client *api.Client, target string, params 
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
+	defer resp.Body.Close() //nolint:errcheck
 
 	data, err := io.ReadAll(resp.Body)
 	if err != nil {
@@ -1073,7 +1066,7 @@ func pprofProfile(ctx context.Context, client *api.Client, duration time.Duratio
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
+	defer resp.Body.Close() //nolint:errcheck
 
 	data, err := io.ReadAll(resp.Body)
 	if err != nil {
@@ -1092,7 +1085,7 @@ func pprofTrace(ctx context.Context, client *api.Client, duration time.Duration)
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
+	defer resp.Body.Close() //nolint:errcheck
 
 	data, err := io.ReadAll(resp.Body)
 	if err != nil {
@@ -1119,7 +1112,11 @@ func (c *DebugCommand) writeLogs(ctx context.Context) {
 		c.captureError("log", err)
 		return
 	}
-	defer out.Close()
+	defer func() {
+		if err := out.Close(); err != nil {
+			c.captureError("log", err)
+		}
+	}()
 
 	// Create Monitor specific client based on the cached client
 	mClient, err := c.cachedClient.Clone()

@@ -183,9 +183,7 @@ func (b *backend) getPolicy(ctx context.Context, polReq keysutil.PolicyRequest, 
 }
 
 func (b *backend) invalidate(ctx context.Context, key string) {
-	if b.Logger().IsDebug() {
-		b.Logger().Debug("invalidating key", "key", key)
-	}
+	b.Logger().Debug("invalidating key", "key", key)
 	switch {
 	case strings.HasPrefix(key, "policy/"):
 		name := strings.TrimPrefix(key, "policy/")
@@ -286,9 +284,7 @@ func (b *backend) rotateIfRequired(ctx context.Context, req *logical.Request, ke
 	// Retrieve the latest version of the policy and determine if it is time to rotate.
 	latestKey := p.Keys[strconv.Itoa(p.LatestVersion)]
 	if time.Now().After(latestKey.CreationTime.Add(p.AutoRotatePeriod)) {
-		if b.Logger().IsDebug() {
-			b.Logger().Debug("automatically rotating key", "key", key)
-		}
+		b.Logger().Debug("automatically rotating key", "key", key)
 		return p.Rotate(ctx, req.Storage, b.GetRandomReader())
 
 	}

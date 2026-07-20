@@ -21,8 +21,8 @@ type EvaluationHistory struct {
 	//  - Name of request block
 	//  - Actual data (usually map string->interface)
 
-	Requests  map[string]map[string]map[string]interface{}
-	Responses map[string]map[string]map[string]interface{}
+	Requests  map[string]map[string]map[string]interface{} `json:"requests"`
+	Responses map[string]map[string]map[string]interface{} `json:"responses"`
 }
 
 func (eh *EvaluationHistory) AddRequest(outerBlock string, requestBlock string, request *logical.Request) error {
@@ -161,7 +161,7 @@ func (eh *EvaluationHistory) getField(obj interface{}, rawFieldSelector []interf
 
 			val, present := mapBase[selector]
 			if !present {
-				return nil, fmt.Errorf("field %q at depth %v is missing:\n\tavailable keys: %v\n\tobj: %#v", selector, i, presentKeys(mapBase), mapBase)
+				return nil, fmt.Errorf("field %q at depth %v is missing:\n\tavailable keys: %v", selector, i, presentKeys(mapBase))
 			}
 
 			if i == len(rawFieldSelector)-1 {

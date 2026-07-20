@@ -56,7 +56,7 @@ type migratorConfig struct {
 }
 
 func (c *OperatorMigrateCommand) Synopsis() string {
-	return "Migrates Vault data between storage backends"
+	return "Migrates OpenBao data between storage backends"
 }
 
 func (c *OperatorMigrateCommand) Help() string {
@@ -65,7 +65,7 @@ Usage: bao operator migrate [options]
 
   This command starts a storage backend migration process to copy all data
   from one backend to another. This operates directly on encrypted data and
-  does not require a Vault server, nor any unsealing.
+  does not require an OpenBao server, nor any unsealing.
 
   Start a migration with a configuration file:
 
@@ -184,7 +184,7 @@ func (c *OperatorMigrateCommand) Run(args []string) int {
 
 // migrate attempts to instantiate the source and destinations backends,
 // and then invoke the migration the root of the keyspace.
-func (c *OperatorMigrateCommand) migrate(config *migratorConfig) error {
+func (c *OperatorMigrateCommand) migrate(config *migratorConfig) (err error) {
 	from, err := c.newBackend(config.StorageSource.Type, config.StorageSource.Config)
 	if err != nil {
 		return fmt.Errorf("error mounting 'storage_source': %w", err)
@@ -221,7 +221,9 @@ func (c *OperatorMigrateCommand) migrate(config *migratorConfig) error {
 			return fmt.Errorf("error setting migration lock: %w", err)
 		}
 
-		defer SetStorageMigration(from, false)
+		defer func() {
+			err = errors.Join(err, SetStorageMigration(from, false))
+		}()
 	}
 
 	ctx, cancelFunc := context.WithCancel(context.Background())

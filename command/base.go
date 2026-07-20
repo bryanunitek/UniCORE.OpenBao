@@ -19,8 +19,8 @@ import (
 	"github.com/openbao/openbao/api/v2"
 	"github.com/openbao/openbao/command/server"
 	"github.com/openbao/openbao/command/token"
+	"github.com/openbao/openbao/helper/configutil"
 	"github.com/openbao/openbao/helper/namespace"
-	"github.com/openbao/openbao/internalshared/configutil"
 	"github.com/posener/complete"
 )
 
@@ -75,7 +75,7 @@ type BaseCommand struct {
 
 // Construct the HTTP API client, but do not set the token on it yet. This is to
 // avoid invoking the token helper for calls that do not need a token, such as
-// `vault login`.
+// `bao login`.
 func (c *BaseCommand) ClientWithoutToken() (*api.Client, error) {
 	// Read the test client if present
 	if c.client != nil {
@@ -487,7 +487,7 @@ func (c *BaseCommand) flagSet(bit FlagSetBit) *FlagSets {
 				Target:  &c.flagOutputPolicy,
 				Default: false,
 				Usage: "Instead of executing the request, print an example HCL " +
-					"policy that would be required to run this command, and exit.",
+					"policy that would be required to run this command and exit.",
 			})
 
 			f.StringVar(&StringVar{
@@ -701,7 +701,7 @@ func (f *FlagSet) VisitAll(fn func(*flag.Flag)) {
 
 // printFlagTitle prints a consistently-formatted title to the given writer.
 func printFlagTitle(w io.Writer, s string) {
-	fmt.Fprintf(w, "%s\n\n", s)
+	_, _ = fmt.Fprintf(w, "%s\n\n", s)
 }
 
 // printFlagDetail prints a single flag to the given writer.
@@ -719,14 +719,14 @@ func printFlagDetail(w io.Writer, f *flag.Flag) {
 	}
 
 	if example != "" {
-		fmt.Fprintf(w, "  -%s=<%s>\n", f.Name, example)
+		_, _ = fmt.Fprintf(w, "  -%s=<%s>\n", f.Name, example)
 	} else {
-		fmt.Fprintf(w, "  -%s\n", f.Name)
+		_, _ = fmt.Fprintf(w, "  -%s\n", f.Name)
 	}
 
 	usage := reRemoveWhitespace.ReplaceAllString(f.Usage, " ")
 	indented := wrapAtLengthWithPadding(usage, 6)
-	fmt.Fprintf(w, "%s\n\n", indented)
+	_, _ = fmt.Fprintf(w, "%s\n\n", indented)
 }
 
 func (c *BaseCommand) ParseServerConfig(configFiles []string) (*server.Config, []configutil.ConfigError, error) {

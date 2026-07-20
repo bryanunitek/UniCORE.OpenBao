@@ -8,6 +8,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
+	"maps"
 	"os"
 	"path/filepath"
 	"testing"
@@ -68,7 +69,8 @@ func TestSelfSignedCA(t *testing.T) {
 		EnableHostVerification: true,
 	}
 
-	host, cleanup := cassandra.PrepareTestContainer(t,
+	host, cleanup := cassandra.PrepareTestContainer(
+		t,
 		cassandra.CopyFromTo(copyFromTo),
 		cassandra.SslOpts(sslOpts),
 	)
@@ -168,9 +170,7 @@ func TestSelfSignedCA(t *testing.T) {
 			}
 
 			// Apply the generated & common fields to the config to be sent to the DB
-			for k, v := range test.config {
-				config[k] = v
-			}
+			maps.Copy(config, test.config)
 
 			db := new()
 			initReq := dbplugin.InitializeRequest{
@@ -178,7 +178,7 @@ func TestSelfSignedCA(t *testing.T) {
 				VerifyConnection: true,
 			}
 
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 			defer cancel()
 
 			_, err := db.Initialize(ctx, initReq)

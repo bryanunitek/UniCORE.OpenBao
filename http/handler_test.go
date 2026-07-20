@@ -5,14 +5,12 @@ package http
 
 import (
 	"bytes"
-	"context"
 	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"net/textproto"
 	"net/url"
 	"reflect"
 	"runtime"
@@ -23,100 +21,45 @@ import (
 	"github.com/go-test/deep"
 	"github.com/hashicorp/go-cleanhttp"
 	"github.com/openbao/openbao/api/v2"
+	"github.com/openbao/openbao/helper/configutil"
 	"github.com/openbao/openbao/helper/namespace"
 	"github.com/openbao/openbao/helper/versions"
-	"github.com/openbao/openbao/internalshared/configutil"
 	"github.com/openbao/openbao/sdk/v2/helper/consts"
 	"github.com/openbao/openbao/sdk/v2/logical"
 	"github.com/openbao/openbao/vault"
 	"github.com/stretchr/testify/require"
 )
 
-func TestHandler_parseMFAHandler(t *testing.T) {
-	var err error
-	var expectedMFACreds logical.MFACreds
-	req := &logical.Request{
-		Headers: make(map[string][]string),
-	}
+type nilResponseWriter struct{}
 
-	headerName := textproto.CanonicalMIMEHeaderKey(MFAHeaderName)
+func (w *nilResponseWriter) Header() http.Header {
+	return make(http.Header)
+}
 
-	// Set TOTP passcode in the MFA header
-	req.Headers[headerName] = []string{
-		"my_totp:123456",
-		"my_totp:111111",
-		"my_second_mfa:hi=hello",
-		"my_third_mfa",
-	}
-	err = parseMFAHeader(req)
+func (w *nilResponseWriter) Write(b []byte) (int, error) {
+	return 0, nil
+}
+
+func (w *nilResponseWriter) WriteHeader(statusCode int) {}
+
+func TestHandler_HostHeader(t *testing.T) {
+	r, err := http.NewRequest(http.MethodGet, "http://domain.example/v1/path", nil)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("err: %s", err)
 	}
-
-	// Verify that it is being parsed properly
-	expectedMFACreds = logical.MFACreds{
-		"my_totp": []string{
-			"123456",
-			"111111",
-		},
-		"my_second_mfa": []string{
-			"hi=hello",
-		},
-		"my_third_mfa": []string{},
-	}
-	if !reflect.DeepEqual(expectedMFACreds, req.MFACreds) {
-		t.Fatalf("bad: parsed MFACreds; expected: %#v\n actual: %#v\n", expectedMFACreds, req.MFACreds)
-	}
-
-	// Split the creds of a method type in different headers and check if they
-	// all get merged together
-	req.Headers[headerName] = []string{
-		"my_mfa:passcode=123456",
-		"my_mfa:month=july",
-		"my_mfa:day=tuesday",
-	}
-	err = parseMFAHeader(req)
+	r.Header.Add("user-agent", "Test")
+	req, status, err := buildLogicalRequestNoAuth(&nilResponseWriter{}, r)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("err: %s", err)
+	}
+	if status != 0 {
+		t.Fatalf("status: %d", status)
 	}
 
-	expectedMFACreds = logical.MFACreds{
-		"my_mfa": []string{
-			"passcode=123456",
-			"month=july",
-			"day=tuesday",
-		},
-	}
-	if !reflect.DeepEqual(expectedMFACreds, req.MFACreds) {
-		t.Fatalf("bad: parsed MFACreds; expected: %#v\n actual: %#v\n", expectedMFACreds, req.MFACreds)
-	}
-
-	// Header without method name should error out
-	req.Headers[headerName] = []string{
-		":passcode=123456",
-	}
-	err = parseMFAHeader(req)
-	if err == nil {
-		t.Fatalf("expected an error; actual: %#v\n", req.MFACreds)
-	}
-
-	// Header without method name and method value should error out
-	req.Headers[headerName] = []string{
-		":",
-	}
-	err = parseMFAHeader(req)
-	if err == nil {
-		t.Fatalf("expected an error; actual: %#v\n", req.MFACreds)
-	}
-
-	// Header without method name and method value should error out
-	req.Headers[headerName] = []string{
-		"my_totp:",
-	}
-	err = parseMFAHeader(req)
-	if err == nil {
-		t.Fatalf("expected an error; actual: %#v\n", req.MFACreds)
-	}
+	require.Subset(t, req.Headers, http.Header{
+		http.CanonicalHeaderKey("user-agent"): {"Test"},
+		http.CanonicalHeaderKey("host"):       {"domain.example"},
+	})
 }
 
 func TestHandler_cors(t *testing.T) {
@@ -126,7 +69,7 @@ func TestHandler_cors(t *testing.T) {
 
 	// Enable CORS and allow from any origin for testing.
 	corsConfig := core.CORSConfig()
-	err := corsConfig.Enable(context.Background(), []string{addr}, nil)
+	err := corsConfig.Enable(t.Context(), []string{addr}, nil, false)
 	if err != nil {
 		t.Fatalf("Error enabling CORS: %s", err)
 	}
@@ -198,6 +141,31 @@ func TestHandler_cors(t *testing.T) {
 			t.Fatalf("bad:\nExpected: %#v\nActual: %#v\n", expected, actual)
 		}
 	}
+
+	// Test that the Access-Control-Allow-Credentials is set correctly when configured
+	err = corsConfig.Enable(t.Context(), []string{addr}, nil, true)
+	if err != nil {
+		t.Fatalf("Error enabling CORS: %s", err)
+	}
+
+	client = cleanhttp.DefaultClient()
+	resp, err = client.Do(req)
+	if err != nil {
+		t.Fatalf("err: %s", err)
+	}
+
+	expHeaders["Access-Control-Allow-Credentials"] = "true"
+
+	for expHeader, expected := range expHeaders {
+		actual := resp.Header.Get(expHeader)
+		if actual == "" {
+			t.Fatalf("bad:\nHeader: %#v was not on response.", expHeader)
+		}
+
+		if actual != expected {
+			t.Fatalf("bad:\nExpected: %#v\nActual: %#v\n", expected, actual)
+		}
+	}
 }
 
 func TestHandler_HostnameHeader(t *testing.T) {
@@ -249,7 +217,7 @@ func TestHandler_HostnameHeader(t *testing.T) {
 				t.Fatal("nil response")
 			}
 
-			hnHeader := resp.Header.Get("X-Vault-Hostname")
+			hnHeader := resp.Header.Get(consts.HostnameHeaderName)
 			if tc.headerPresent && hnHeader == "" {
 				t.Logf("header configured = %t", core.HostnameHeaderEnabled())
 				t.Fatal("missing 'X-Vault-Hostname' header entry in response")
@@ -258,7 +226,7 @@ func TestHandler_HostnameHeader(t *testing.T) {
 				t.Fatal("didn't expect 'X-Vault-Hostname' header but it was present anyway")
 			}
 
-			rniHeader := resp.Header.Get("X-Vault-Raft-Node-ID")
+			rniHeader := resp.Header.Get(consts.RaftNodeIDHeaderName)
 			if rniHeader != "" {
 				t.Fatalf("no raft node ID header was expected, since we're not running a raft cluster. instead, got %s", rniHeader)
 			}
@@ -276,7 +244,7 @@ func TestHandler_CacheControlNoStore(t *testing.T) {
 		t.Fatalf("err: %s", err)
 	}
 	req.Header.Set(consts.AuthHeaderName, token)
-	req.Header.Set(WrapTTLHeaderName, "60s")
+	req.Header.Set(consts.WrapTTLHeaderName, "60s")
 
 	client := cleanhttp.DefaultClient()
 	resp, err := client.Do(req)
@@ -352,7 +320,7 @@ func TestHandler_MissingToken(t *testing.T) {
 		t.Fatalf("err: %s", err)
 	}
 
-	req.Header.Set(WrapTTLHeaderName, "60s")
+	req.Header.Set(consts.WrapTTLHeaderName, "60s")
 
 	client := cleanhttp.DefaultClient()
 	resp, err := client.Do(req)
@@ -581,7 +549,7 @@ func TestSysMounts_headerAuth_Wrapped(t *testing.T) {
 		t.Fatalf("err: %s", err)
 	}
 	req.Header.Set(consts.AuthHeaderName, token)
-	req.Header.Set(WrapTTLHeaderName, "60s")
+	req.Header.Set(consts.WrapTTLHeaderName, "60s")
 
 	client := cleanhttp.DefaultClient()
 	resp, err := client.Do(req)
@@ -706,7 +674,7 @@ func TestHandler_error(t *testing.T) {
 func TestHandler_requestAuth(t *testing.T) {
 	core, _, token := vault.TestCoreUnsealed(t)
 
-	rootCtx := namespace.RootContext(nil)
+	rootCtx := namespace.RootContext(t.Context())
 	te, err := core.LookupToken(rootCtx, token)
 	if err != nil {
 		t.Fatalf("err: %s", err)
@@ -913,7 +881,7 @@ func TestHandler_MaxRequestSize(t *testing.T) {
 	defer cluster.Cleanup()
 
 	client := cluster.Cores[0].Client
-	_, err := client.KVv2("secret").Put(context.Background(), "foo", map[string]interface{}{
+	_, err := client.KVv2("secret").Put(t.Context(), "foo", map[string]interface{}{
 		"bar": strings.Repeat("a", 1025),
 	})
 
@@ -958,7 +926,8 @@ func TestHandler_MaxRequestSize_Memory(t *testing.T) {
 func TestHandler_RestrictedEndpointCalls(t *testing.T) {
 	core, _, token := vault.TestCoreUnsealed(t)
 	// add namespaces for tests
-	vault.TestCoreCreateNamespaces(t, core,
+	vault.TestCoreCreateNamespaces(
+		t, core,
 		&namespace.Namespace{Path: "test"},
 		&namespace.Namespace{Path: "test/test2"},
 	)

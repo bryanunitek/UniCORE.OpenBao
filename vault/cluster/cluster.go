@@ -66,7 +66,7 @@ type ClusterHook interface {
 type Listener struct {
 	handlers   map[string]Handler
 	clients    map[string]Client
-	shutdown   *uint32
+	shutdown   atomic.Bool
 	shutdownWg *sync.WaitGroup
 	server     *http2.Server
 
@@ -107,7 +107,6 @@ func NewListener(networkLayer NetworkLayer, cipherSuites []uint16, logger log.Lo
 	return &Listener{
 		handlers:   make(map[string]Handler),
 		clients:    make(map[string]Client),
-		shutdown:   new(uint32),
 		shutdownWg: &sync.WaitGroup{},
 		server:     h2Server,
 
@@ -293,9 +292,7 @@ func (cl *Listener) Run(ctx context.Context) error {
 		// Wrap the listener with TLS
 		tlsLn := tls.NewListener(localLn, tlsConfig)
 
-		if cl.logger.IsInfo() {
-			cl.logger.Info("serving cluster requests", "cluster_listen_address", tlsLn.Addr())
-		}
+		cl.logger.Info("serving cluster requests", "cluster_listen_address", tlsLn.Addr())
 
 		cl.shutdownWg.Add(1)
 		// Start our listening loop
@@ -316,7 +313,7 @@ func (cl *Listener) Run(ctx context.Context) error {
 
 			var loopDelay time.Duration
 			for {
-				if atomic.LoadUint32(cl.shutdown) > 0 {
+				if cl.shutdown.Load() {
 					return
 				}
 
@@ -370,18 +367,14 @@ func (cl *Listener) Run(ctx context.Context) error {
 				// aggressive here is fine.
 				err = tlsConn.SetDeadline(time.Now().Add(30 * time.Second))
 				if err != nil {
-					if cl.logger.IsDebug() {
-						cl.logger.Debug("error setting deadline for cluster connection", "error", err)
-					}
+					cl.logger.Debug("error setting deadline for cluster connection", "error", err)
 					tlsConn.Close()
 					continue
 				}
 
 				err = tlsConn.Handshake()
 				if err != nil {
-					if cl.logger.IsDebug() {
-						cl.logger.Debug("error handshaking cluster connection", "error", err)
-					}
+					cl.logger.Debug("error handshaking cluster connection", "error", err)
 					tlsConn.Close()
 					continue
 				}
@@ -391,9 +384,7 @@ func (cl *Listener) Run(ctx context.Context) error {
 				// Now, set it back to unlimited
 				err = tlsConn.SetDeadline(time.Time{})
 				if err != nil {
-					if cl.logger.IsDebug() {
-						cl.logger.Debug("error setting deadline for cluster connection", "error", err)
-					}
+					cl.logger.Debug("error setting deadline for cluster connection", "error", err)
 					tlsConn.Close()
 					continue
 				}
@@ -422,7 +413,7 @@ func (cl *Listener) Run(ctx context.Context) error {
 func (cl *Listener) Stop() {
 	// Set the shutdown flag. This will cause the listeners to shut down
 	// within the deadline in clusterListenerAcceptDeadline
-	atomic.StoreUint32(cl.shutdown, 1)
+	cl.shutdown.Store(true)
 	cl.logger.Info("forwarding rpc listeners stopped")
 
 	// Wait for them all to shut down

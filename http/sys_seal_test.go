@@ -4,7 +4,6 @@
 package http
 
 import (
-	"context"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -15,6 +14,7 @@ import (
 	"testing"
 
 	"github.com/go-test/deep"
+	wrapping "github.com/openbao/go-kms-wrapping/v2"
 	"github.com/openbao/openbao/helper/namespace"
 	"github.com/openbao/openbao/helper/testhelpers"
 	"github.com/openbao/openbao/sdk/v2/logical"
@@ -46,7 +46,7 @@ func TestSysSealStatus(t *testing.T) {
 		"recovery_seal": false,
 		"initialized":   true,
 		"migration":     false,
-		"build_date":    version.BuildDate,
+		"commit_date":   version.CommitDate,
 	}
 	testResponseStatus(t, resp, 200)
 	testResponseBody(t, resp, &actual)
@@ -131,7 +131,7 @@ func TestSysUnseal(t *testing.T) {
 			"recovery_seal": false,
 			"initialized":   true,
 			"migration":     false,
-			"build_date":    version.BuildDate,
+			"commit_date":   version.CommitDate,
 		}
 		if i == len(keys)-1 {
 			expected["sealed"] = false
@@ -166,7 +166,7 @@ func TestSysUnseal(t *testing.T) {
 
 func subtestBadSingleKey(t *testing.T, seal vault.Seal) {
 	core := vault.TestCoreWithSeal(t, seal, false)
-	_, err := core.Initialize(context.Background(), &vault.InitParams{
+	_, err := core.Initialize(namespace.RootContext(t.Context()), &vault.InitParams{
 		BarrierConfig: &vault.SealConfig{
 			SecretShares:    1,
 			SecretThreshold: 1,
@@ -251,7 +251,7 @@ func subtestBadMultiKey(t *testing.T, seal vault.Seal) {
 	numKeys := 3
 
 	core := vault.TestCoreWithSeal(t, seal, false)
-	_, err := core.Initialize(context.Background(), &vault.InitParams{
+	_, err := core.Initialize(namespace.RootContext(t.Context()), &vault.InitParams{
 		BarrierConfig: &vault.SealConfig{
 			SecretShares:    numKeys,
 			SecretThreshold: numKeys,
@@ -319,7 +319,7 @@ func subtestBadMultiKey(t *testing.T, seal vault.Seal) {
 
 func TestSysUnseal_BadKeyNewShamir(t *testing.T) {
 	seal := vault.NewTestSeal(t,
-		&seal.TestSealOpts{StoredKeys: seal.StoredKeysSupportedShamirRoot})
+		&seal.TestSealOpts{Wrapper: seal.WrapperTypeShamir})
 
 	subtestBadSingleKey(t, seal)
 	subtestBadMultiKey(t, seal)
@@ -327,7 +327,7 @@ func TestSysUnseal_BadKeyNewShamir(t *testing.T) {
 
 func TestSysUnseal_BadKeyAutoUnseal(t *testing.T) {
 	seal := vault.NewTestSeal(t,
-		&seal.TestSealOpts{StoredKeys: seal.StoredKeysSupportedGeneric})
+		&seal.TestSealOpts{Wrapper: wrapping.WrapperTypeTest})
 
 	subtestBadSingleKey(t, seal)
 	subtestBadMultiKey(t, seal)
@@ -370,7 +370,7 @@ func TestSysUnseal_Reset(t *testing.T) {
 			"recovery_seal": false,
 			"initialized":   true,
 			"migration":     false,
-			"build_date":    version.BuildDate,
+			"commit_date":   version.CommitDate,
 		}
 		testResponseStatus(t, resp, 200)
 		testResponseBody(t, resp, &actual)
@@ -410,7 +410,7 @@ func TestSysUnseal_Reset(t *testing.T) {
 		"type":          "shamir",
 		"recovery_seal": false,
 		"initialized":   true,
-		"build_date":    version.BuildDate,
+		"commit_date":   version.CommitDate,
 		"migration":     false,
 	}
 	testResponseStatus(t, resp, 200)
@@ -456,7 +456,7 @@ func TestSysSeal_Permissions(t *testing.T) {
 		},
 		ClientToken: root,
 	}
-	resp, err := core.HandleRequest(namespace.RootContext(nil), req)
+	resp, err := core.HandleRequest(namespace.RootContext(t.Context()), req)
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -471,7 +471,7 @@ func TestSysSeal_Permissions(t *testing.T) {
 		"policies": []string{"test"},
 	}
 
-	resp, err = core.HandleRequest(namespace.RootContext(nil), req)
+	resp, err = core.HandleRequest(namespace.RootContext(t.Context()), req)
 	if err != nil {
 		t.Fatalf("err: %v %v", err, resp)
 	}
@@ -494,7 +494,7 @@ func TestSysSeal_Permissions(t *testing.T) {
 		},
 		ClientToken: root,
 	}
-	resp, err = core.HandleRequest(namespace.RootContext(nil), req)
+	resp, err = core.HandleRequest(namespace.RootContext(t.Context()), req)
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -515,7 +515,7 @@ func TestSysSeal_Permissions(t *testing.T) {
 		},
 		ClientToken: root,
 	}
-	resp, err = core.HandleRequest(namespace.RootContext(nil), req)
+	resp, err = core.HandleRequest(namespace.RootContext(t.Context()), req)
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -536,7 +536,7 @@ func TestSysSeal_Permissions(t *testing.T) {
 		},
 		ClientToken: root,
 	}
-	resp, err = core.HandleRequest(namespace.RootContext(nil), req)
+	resp, err = core.HandleRequest(namespace.RootContext(t.Context()), req)
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}

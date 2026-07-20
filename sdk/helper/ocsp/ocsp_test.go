@@ -4,7 +4,6 @@ package ocsp
 
 import (
 	"bytes"
-	"context"
 	"crypto"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -61,7 +60,7 @@ func TestOCSP(t *testing.T) {
 			if err != nil {
 				t.Fatalf("failed to GET contents. err: %v", err)
 			}
-			defer res.Body.Close()
+			defer res.Body.Close() //nolint:errcheck
 			_, err = io.ReadAll(res.Body)
 			if err != nil {
 				t.Fatalf("failed to read content body for %v", tgt)
@@ -233,7 +232,7 @@ func TestUnitExpiredOCSPResponse(t *testing.T) {
 	}
 	client := New(logFactory, 100)
 
-	ctx := context.Background()
+	ctx := t.Context()
 
 	config := &VerifyConfig{
 		OcspEnabled:         true,
@@ -317,7 +316,7 @@ func TestUnitNoCachedOCSPResponse(t *testing.T) {
 	}
 	client := New(logFactory, 100)
 
-	ctx := context.Background()
+	ctx := t.Context()
 
 	config := &VerifyConfig{
 		OcspEnabled:         true,
@@ -435,10 +434,11 @@ func TestOCSPRetry(t *testing.T) {
 		t:       t,
 	}
 	res, b, st, err := c.retryOCSP(
-		context.TODO(),
+		t.Context(),
 		client, fakeRequestFunc,
 		dummyOCSPHost,
-		make(map[string]string), []byte{0}, certs[len(certs)-1])
+		make(map[string]string), []byte{0}, certs[len(certs)-1],
+	)
 	if err == nil {
 		fmt.Printf("should fail: %v, %v, %v\n", res, b, st)
 	}
@@ -450,10 +450,11 @@ func TestOCSPRetry(t *testing.T) {
 		t:       t,
 	}
 	res, b, st, err = c.retryOCSP(
-		context.TODO(),
+		t.Context(),
 		client, fakeRequestFunc,
 		dummyOCSPHost,
-		make(map[string]string), []byte{0}, certs[len(certs)-1])
+		make(map[string]string), []byte{0}, certs[len(certs)-1],
+	)
 	if err == nil {
 		fmt.Printf("should fail: %v, %v, %v\n", res, b, st)
 	}

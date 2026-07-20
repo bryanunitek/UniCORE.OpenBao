@@ -33,6 +33,8 @@ import (
 	"github.com/openbao/openbao/sdk/v2/helper/jsonutil"
 	"github.com/openbao/openbao/sdk/v2/helper/locksutil"
 	"github.com/openbao/openbao/sdk/v2/logical"
+	"github.com/openbao/openbao/vault/barrier"
+	"github.com/openbao/openbao/vault/routing"
 )
 
 const (
@@ -98,7 +100,7 @@ type pendingInfo struct {
 // the ExpirationManager will handle doing automatic revocation.
 type ExpirationManager struct {
 	core       *Core
-	router     *Router
+	router     *routing.Router
 	tokenStore *TokenStore
 	logger     log.Logger
 
@@ -129,9 +131,9 @@ type ExpirationManager struct {
 	uniquePolicies      map[string][]string
 	emptyUniquePolicies *time.Ticker
 
-	tidyLock *int32
+	tidyLock atomic.Bool
 
-	restoreMode        *int32
+	restoreMode        atomic.Int64
 	restoreModeLock    sync.RWMutex
 	restoreRequestLock sync.RWMutex
 	restoreLocks       []*locksutil.LockEntry
@@ -141,7 +143,7 @@ type ExpirationManager struct {
 	// do not hold coreStateLock in any API handler code - it is already held
 	coreStateLock     locking.RWMutex
 	quitContext       context.Context
-	leaseCheckCounter *uint32
+	leaseCheckCounter atomic.Uint32
 
 	logLeaseExpirations bool
 	expireFunc          atomic.Pointer[ExpireLeaseStrategy]
@@ -332,19 +334,16 @@ func NewExpirationManager(c *Core, e ExpireLeaseStrategy, logger log.Logger, det
 		tokenStore:  c.tokenStore,
 		logger:      logger,
 		pendingLock: &locking.SyncRWMutex{},
-		tidyLock:    new(int32),
+
+		restoreLocks: locksutil.CreateLocks(),
 
 		uniquePolicies:      make(map[string][]string),
 		emptyUniquePolicies: time.NewTicker(7 * 24 * time.Hour),
 
-		// new instances of the expiration manager will go immediately into
-		// restore mode
-		restoreMode: new(int32),
-		quitCh:      make(chan struct{}),
+		quitCh: make(chan struct{}),
 
-		coreStateLock:     c.stateLock,
-		quitContext:       c.activeContext,
-		leaseCheckCounter: new(uint32),
+		coreStateLock: c.stateLock,
+		quitContext:   c.activeContext.Load(),
 
 		logLeaseExpirations: api.ReadBaoVariable("BAO_SKIP_LOGGING_LEASE_EXPIRATIONS") == "",
 
@@ -360,8 +359,7 @@ func NewExpirationManager(c *Core, e ExpireLeaseStrategy, logger log.Logger, det
 	// active node
 	if shouldProcessExp {
 		// active nodes start by running in restore mode by default
-		*exp.restoreMode = 1
-		exp.restoreLocks = locksutil.CreateLocks()
+		exp.restoreMode.Add(1)
 	}
 
 	exp.expireFunc.Store(&e)
@@ -447,18 +445,12 @@ func (c *Core) stopExpiration() error {
 	return nil
 }
 
-func (m *ExpirationManager) leaseView(ns *namespace.Namespace) BarrierView {
-	if ns.ID == namespace.RootNamespaceID {
-		return m.core.systemBarrierView.SubView(expirationSubPath + leaseViewPrefix)
-	}
-	return m.core.namespaceMountEntryView(ns, systemBarrierPrefix+expirationSubPath+leaseViewPrefix)
+func (m *ExpirationManager) leaseView(ns *namespace.Namespace) barrier.View {
+	return m.core.NamespaceView(ns).SubView(barrier.SystemBarrierPrefix + expirationSubPath + leaseViewPrefix)
 }
 
-func (m *ExpirationManager) tokenIndexView(ns *namespace.Namespace) BarrierView {
-	if ns.ID == namespace.RootNamespaceID {
-		return m.core.systemBarrierView.SubView(expirationSubPath + tokenViewPrefix)
-	}
-	return m.core.namespaceMountEntryView(ns, systemBarrierPrefix+expirationSubPath+tokenViewPrefix)
+func (m *ExpirationManager) tokenIndexView(ns *namespace.Namespace) barrier.View {
+	return m.core.NamespaceView(ns).SubView(barrier.SystemBarrierPrefix + expirationSubPath + tokenViewPrefix)
 }
 
 func (m *ExpirationManager) collectLeases() (map[*namespace.Namespace][]string, int, error) {
@@ -475,16 +467,26 @@ func (m *ExpirationManager) collectLeases() (map[*namespace.Namespace][]string, 
 			continue
 		}
 
-		view := m.leaseView(namespace)
-		keys, err := logical.CollectKeys(m.quitContext, view)
+		keys, err := m.collectNamespaceLeases(namespace)
 		if err != nil {
-			return nil, 0, fmt.Errorf("failed to scan for leases: %w", err)
+			return nil, 0, err
 		}
+
 		existing[namespace] = keys
 		leaseCount += len(keys)
 	}
 
 	return existing, leaseCount, nil
+}
+
+func (m *ExpirationManager) collectNamespaceLeases(ns *namespace.Namespace) ([]string, error) {
+	view := m.leaseView(ns)
+	keys, err := logical.CollectKeys(m.quitContext, view)
+	if err != nil {
+		return nil, fmt.Errorf("failed to scan for leases: %w", err)
+	}
+
+	return keys, nil
 }
 
 // lockLease takes out a lock for a given lease ID
@@ -499,7 +501,7 @@ func (m *ExpirationManager) unlockLease(leaseID string) {
 
 // inRestoreMode returns if we are currently in restore mode
 func (m *ExpirationManager) inRestoreMode() bool {
-	return atomic.LoadInt32(m.restoreMode) == 1
+	return m.restoreMode.Load() > 0
 }
 
 // invalidate will be used in the future for implementing read replica nodes
@@ -580,12 +582,12 @@ func (m *ExpirationManager) Tidy(ctx context.Context) error {
 	logger := m.logger.Named("tidy")
 	m.core.AddLogger(logger)
 
-	if !atomic.CompareAndSwapInt32(m.tidyLock, 0, 1) {
+	if !m.tidyLock.CompareAndSwap(false, true) {
 		logger.Warn("tidy operation on leases is already in progress")
 		return nil
 	}
 
-	defer atomic.CompareAndSwapInt32(m.tidyLock, 1, 0)
+	defer m.tidyLock.CompareAndSwap(true, false)
 
 	logger.Info("beginning tidy operation on leases")
 	defer logger.Info("finished tidy operation on leases")
@@ -688,14 +690,40 @@ func (m *ExpirationManager) Tidy(ctx context.Context) error {
 }
 
 // Restore is used to recover the lease states when starting.
+//
 // This is used after starting the vault.
-func (m *ExpirationManager) Restore(errorFunc func()) (retErr error) {
+func (m *ExpirationManager) Restore(errorFunc func()) error {
+	return m.restore(m.collectLeases, nil /* global */, errorFunc)
+}
+
+// Restore is used to restore the leases belonging to a particular namespace
+// when it unseals.
+func (m *ExpirationManager) RestoreNamespace(ns *namespace.Namespace, errorFunc func()) error {
+	if m.core.Standby() {
+		m.logger.Info("skipping namespace lease restoration - standby")
+		return nil
+	}
+
+	m.restoreMode.Add(1)
+	return m.restore(func() (map[*namespace.Namespace][]string, int, error) {
+		leases, err := m.collectNamespaceLeases(ns)
+		if err != nil {
+			return nil, 0, err
+		}
+
+		return map[*namespace.Namespace][]string{
+			ns.Clone(false): leases,
+		}, len(leases), nil
+	}, ns, errorFunc)
+}
+
+func (m *ExpirationManager) restore(collect func() (map[*namespace.Namespace][]string, int, error), restoreNs *namespace.Namespace, errorFunc func()) (retErr error) {
 	defer func() {
 		// Turn off restore mode. We can do this safely without the lock because
 		// if restore mode finished successfully, restore mode was already
 		// disabled with the lock. In an error state, this will allow the
 		// Stop() function to shut everything down.
-		atomic.StoreInt32(m.restoreMode, 0)
+		m.restoreMode.Add(-1)
 
 		switch {
 		case retErr == nil:
@@ -703,7 +731,7 @@ func (m *ExpirationManager) Restore(errorFunc func()) (retErr error) {
 			// Don't run error func because we lost leadership
 			m.logger.Warn("context canceled while restoring leases, stopping lease loading")
 			retErr = nil
-		case errwrap.Contains(retErr, ErrBarrierSealed.Error()):
+		case errwrap.Contains(retErr, barrier.ErrBarrierSealed.Error()):
 			// Don't run error func because we're likely already shutting down
 			m.logger.Warn("barrier sealed while restoring leases, stopping lease loading")
 			retErr = nil
@@ -717,11 +745,11 @@ func (m *ExpirationManager) Restore(errorFunc func()) (retErr error) {
 
 	// Accumulate existing leases
 	m.logger.Debug("collecting leases")
-	existing, leaseCount, err := m.collectLeases()
+	existing, leaseCount, err := collect()
 	if err != nil {
 		return err
 	}
-	m.logger.Debug("leases collected", "num_existing", leaseCount)
+	m.logger.Debug("leases collected", "num_existing", leaseCount, "namespaces", len(existing))
 
 	// Make the channels used for the worker pool
 	type lease struct {
@@ -823,12 +851,12 @@ LOOP:
 	}
 
 	m.restoreModeLock.Lock()
-	atomic.StoreInt32(m.restoreMode, 0)
-	m.restoreLoaded.Range(func(k, v interface{}) bool {
-		m.restoreLoaded.Delete(k)
+	m.restoreLoaded.Range(func(keyRaw any, _ any) bool {
+		if key, ok := keyRaw.(string); ok && (restoreNs == nil || restoreNs.MatchesID(key)) {
+			m.restoreLoaded.Delete(key)
+		}
 		return true
 	})
-	m.restoreLocks = nil
 	m.restoreModeLock.Unlock()
 
 	m.logger.Info("lease restore complete")
@@ -906,6 +934,75 @@ func (m *ExpirationManager) Stop() error {
 	m.emptyUniquePolicies.Stop()
 
 	return nil
+}
+
+// StopNamespace removes all information related to a namespace without
+// affecting other namespaces.
+func (m *ExpirationManager) StopNamespace(ns *namespace.Namespace) {
+	m.pendingLock.Lock()
+	defer m.pendingLock.Unlock()
+
+	leaseIds := make(map[string]struct{})
+
+	// irrevocable holds an in-memory copy of a lease; safe to delete.
+	m.irrevocable.Range(func(keyRaw any, _ any) bool {
+		if key, ok := keyRaw.(string); ok && ns.MatchesID(key) {
+			m.irrevocable.Delete(key)
+			m.irrevocableLeaseCount -= 1
+			leaseIds[key] = struct{}{}
+		}
+		return true
+	})
+
+	// pending holds a pendingInfo object; cancel the associated timer so
+	// we don't spam failures to revoke.
+	m.pending.Range(func(keyRaw any, infoRaw any) bool {
+		if key, ok := keyRaw.(string); ok && ns.MatchesID(key) {
+			info, ok := infoRaw.(pendingInfo)
+			if !ok {
+				return true
+			}
+
+			// Cancel the timer so it doesn't fire again.
+			info.timer.Stop()
+			m.pending.Delete(key)
+			leaseIds[key] = struct{}{}
+		}
+		return true
+	})
+
+	// nonexpiring holds a pendingInfo object; cancel the associated timer so
+	// we don't spam failures to revoke.
+	m.nonexpiring.Range(func(keyRaw any, infoRaw any) bool {
+		if key, ok := keyRaw.(string); ok && ns.MatchesID(key) {
+			info, ok := infoRaw.(pendingInfo)
+			if !ok {
+				return true
+			}
+
+			// Cancel the timer so it doesn't fire again.
+			info.timer.Stop()
+			m.nonexpiring.Delete(key)
+			leaseIds[key] = struct{}{}
+		}
+		return true
+	})
+
+	m.lockPerLease.Range(func(keyRaw any, _ any) bool {
+		if key, ok := keyRaw.(string); ok && ns.MatchesID(key) {
+			m.deleteLockForLease(key)
+		}
+		return true
+	})
+
+	m.restoreLoaded.Range(func(keyRaw any, _ any) bool {
+		if key, ok := keyRaw.(string); ok && ns.MatchesID(key) {
+			m.restoreLoaded.Delete(key)
+		}
+		return true
+	})
+
+	m.leaseCount -= len(leaseIds)
 }
 
 // Revoke is used to revoke a secret named by the given LeaseID
@@ -1020,9 +1117,7 @@ func (m *ExpirationManager) revokeCommon(ctx context.Context, leaseID string, fo
 				return err
 			}
 
-			if m.logger.IsWarn() {
-				m.logger.Warn("revocation from the backend failed, but in force mode so ignoring", "error", err)
-			}
+			m.logger.Warn("revocation from the backend failed, but in force mode so ignoring", "error", err)
 		}
 	}
 
@@ -1069,7 +1164,7 @@ func (m *ExpirationManager) revokeCommon(ctx context.Context, leaseID string, fo
 	}
 	m.pendingLock.Unlock()
 
-	if m.logger.IsInfo() && !skipToken && m.logLeaseExpirations {
+	if !skipToken && m.logLeaseExpirations {
 		m.logger.Info("revoked lease", "lease_id", leaseID)
 	}
 	if m.logger.IsWarn() && !skipToken && le.isIncorrectlyNonExpiring() {
@@ -1413,7 +1508,7 @@ func (m *ExpirationManager) RenewToken(ctx context.Context, req *logical.Request
 		if resp.Auth.Alias != nil {
 			mountAccessor = resp.Auth.Alias.MountAccessor
 		}
-		validAliases, err := m.core.identityStore.refreshExternalGroupMembershipsByEntityID(ctx, resp.Auth.EntityID, resp.Auth.GroupAliases, mountAccessor)
+		validAliases, err := m.core.identityStore.RefreshExternalGroupMembershipsByEntityID(ctx, resp.Auth.EntityID, resp.Auth.GroupAliases, mountAccessor)
 		if err != nil {
 			return nil, err
 		}
@@ -1600,6 +1695,11 @@ func (m *ExpirationManager) RegisterAuth(ctx context.Context, te *logical.TokenE
 		return consts.ErrPathContainsParentReferences
 	}
 
+	if !persistLease {
+		// Do no further work if we are not persisting the lease.
+		return nil
+	}
+
 	tokenNS, err := m.core.NamespaceByID(ctx, te.NamespaceID)
 	if err != nil {
 		return err
@@ -1637,10 +1737,8 @@ func (m *ExpirationManager) RegisterAuth(ctx context.Context, te *logical.TokenE
 	defer leaseLock.Unlock()
 
 	// Encode the entry
-	if persistLease {
-		if err := m.persistEntry(ctx, &le); err != nil {
-			return err
-		}
+	if err := m.persistEntry(ctx, &le); err != nil {
+		return err
 	}
 
 	// Setup revocation timer
@@ -1694,13 +1792,12 @@ func (m *ExpirationManager) FetchLeaseTimesByToken(ctx context.Context, te *logi
 		leaseID = fmt.Sprintf("%s.%s", leaseID, tokenNS.ID)
 	}
 
-	return m.FetchLeaseTimes(ctx, leaseID)
+	return m.FetchLeaseInfo(ctx, leaseID)
 }
 
-// FetchLeaseTimes is used to fetch the issue time, expiration time, and last
-// renewed time of a lease entry. It returns a leaseEntry itself, but with only
-// those values copied over.
-func (m *ExpirationManager) FetchLeaseTimes(ctx context.Context, leaseID string) (*leaseEntry, error) {
+// FetchLeaseInfo is used to fetch non sensitive information of a lease entry.
+// It returns a leaseEntry itself, but with only those values copied over.
+func (m *ExpirationManager) FetchLeaseInfo(ctx context.Context, leaseID string) (*leaseEntry, error) {
 	defer metrics.MeasureSince([]string{"expire", "fetch-lease-times"}, time.Now())
 
 	le := m.fetchCachedLease(leaseID)
@@ -1725,7 +1822,7 @@ func (m *ExpirationManager) FetchLeaseTimes(ctx context.Context, leaseID string)
 		return nil, nil
 	}
 
-	return m.leaseTimesForExport(le), nil
+	return m.leaseInfoForExport(le), nil
 }
 
 // fetchCachedLease attempts to look up a lease ID by pending or irrevocable
@@ -1733,23 +1830,25 @@ func (m *ExpirationManager) FetchLeaseTimes(ctx context.Context, leaseID string)
 func (m *ExpirationManager) fetchCachedLease(leaseID string) *leaseEntry {
 	info, ok := m.pending.Load(leaseID)
 	if ok && info.(pendingInfo).cachedLeaseInfo != nil {
-		return m.leaseTimesForExport(info.(pendingInfo).cachedLeaseInfo)
+		return m.leaseInfoForExport(info.(pendingInfo).cachedLeaseInfo)
 	}
 
 	info, ok = m.irrevocable.Load(leaseID)
 	if ok && info.(*leaseEntry) != nil {
-		return m.leaseTimesForExport(info.(*leaseEntry))
+		return m.leaseInfoForExport(info.(*leaseEntry))
 	}
 
 	return nil
 }
 
-// Returns lease times for outside callers based on the full leaseEntry passed in
-func (m *ExpirationManager) leaseTimesForExport(le *leaseEntry) *leaseEntry {
+// Returns redacted leaseEntry for outside callers based on the full leaseEntry passed in
+func (m *ExpirationManager) leaseInfoForExport(le *leaseEntry) *leaseEntry {
 	ret := &leaseEntry{
 		IssueTime:       le.IssueTime,
 		ExpireTime:      le.ExpireTime,
 		LastRenewalTime: le.LastRenewalTime,
+		Path:            le.Path,
+		RevokeErr:       le.RevokeErr,
 		namespace:       le.namespace,
 	}
 	if le.Secret != nil {
@@ -1769,7 +1868,7 @@ func (m *ExpirationManager) leaseTimesForExport(le *leaseEntry) *leaseEntry {
 // Restricts lease entry stored in pendingInfo to a low-cost subset of the
 // information.
 func (m *ExpirationManager) inMemoryLeaseInfo(le *leaseEntry) *leaseEntry {
-	ret := m.leaseTimesForExport(le)
+	ret := m.leaseInfoForExport(le)
 	// Need to index:
 	//   namespace -- derived from lease ID
 	//   policies -- stored in Auth object
@@ -2029,7 +2128,7 @@ func (m *ExpirationManager) loadEntry(ctx context.Context, leaseID string) (*lea
 
 // loadEntryInternal is used when you need to load an entry but also need to
 // control the lifecycle of the restoreLock
-func (m *ExpirationManager) loadEntryInternal(ctx context.Context, leaseID string, restoreMode bool, checkRestored bool) (*leaseEntry, error) {
+func (m *ExpirationManager) loadEntryInternal(ctx context.Context, leaseID string, restoreMode, checkRestored bool) (*leaseEntry, error) {
 	ns, err := namespace.FromContext(ctx)
 	if err != nil {
 		return nil, err
@@ -2356,11 +2455,11 @@ func (m *ExpirationManager) emitMetrics() {
 	metrics.SetGauge([]string{"expire", "num_irrevocable_leases"}, float32(irrevocableLeases))
 	// Check if lease count is greater than the threshold
 	if allLeases > maxLeaseThreshold {
-		if atomic.LoadUint32(m.leaseCheckCounter) > 59 {
+		if m.leaseCheckCounter.Load() > 59 {
 			m.logger.Warn("lease count exceeds warning lease threshold", "have", allLeases, "threshold", maxLeaseThreshold)
-			atomic.StoreUint32(m.leaseCheckCounter, 0)
+			m.leaseCheckCounter.Store(0)
 		} else {
-			atomic.AddUint32(m.leaseCheckCounter, 1)
+			m.leaseCheckCounter.Add(1)
 		}
 	}
 }

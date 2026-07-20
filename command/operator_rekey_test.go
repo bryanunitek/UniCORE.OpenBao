@@ -12,9 +12,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/openbao/openbao/sdk/v2/helper/roottoken"
-
 	"github.com/hashicorp/cli"
+	"github.com/hashicorp/go-secure-stdlib/base62"
 	"github.com/openbao/openbao/api/v2"
 )
 
@@ -323,7 +322,7 @@ func TestOperatorRekeyCommand_Run(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		otp, err := roottoken.GenerateOTP(rootStatus.OTPLength)
+		otp, err := base62.Random(rootStatus.OTPLength)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -552,7 +551,7 @@ func TestOperatorRekeyCommand_Run(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		otp, err := roottoken.GenerateOTP(rootStatus.OTPLength)
+		otp, err := base62.Random(rootStatus.OTPLength)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -599,7 +598,7 @@ func TestOperatorRekeyCommand_Run(t *testing.T) {
 		}
 		nonce := status.Nonce
 
-		var combined string
+		var combined strings.Builder
 		// Supply the unseal keys
 		for _, key := range keys {
 			ui, cmd := testOperatorRekeyCommand(t)
@@ -614,11 +613,11 @@ func TestOperatorRekeyCommand_Run(t *testing.T) {
 			}
 
 			// Append to our output string
-			combined += ui.OutputWriter.String()
+			combined.WriteString(ui.OutputWriter.String())
 		}
 
 		re := regexp.MustCompile(`Key 1 fingerprint: (.+); value: (.+)`)
-		match := re.FindAllStringSubmatch(combined, -1)
+		match := re.FindAllStringSubmatch(combined.String(), -1)
 		if len(match) < 1 || len(match[0]) < 3 {
 			t.Fatalf("bad match: %#v", match)
 		}

@@ -21,8 +21,8 @@ import (
 	auditFile "github.com/openbao/openbao/builtin/audit/file"
 	kv "github.com/openbao/openbao/builtin/logical/kv"
 	"github.com/openbao/openbao/command/server"
+	"github.com/openbao/openbao/helper/configutil"
 	"github.com/openbao/openbao/helper/testhelpers/corehelpers"
-	"github.com/openbao/openbao/internalshared/configutil"
 	"github.com/openbao/openbao/sdk/v2/helper/consts"
 	"github.com/openbao/openbao/sdk/v2/helper/logging"
 	"github.com/openbao/openbao/sdk/v2/logical"
@@ -324,7 +324,7 @@ func TestLogical_RequestSizeDisableLimit(t *testing.T) {
 func TestLogical_ListSuffix(t *testing.T) {
 	core, _, rootToken := vault.TestCoreUnsealed(t)
 	req, _ := http.NewRequest("GET", "http://127.0.0.1:8200/v1/secret/foo", nil)
-	req = req.WithContext(namespace.RootContext(nil))
+	req = req.WithContext(namespace.RootContext(t.Context()))
 	req.Header.Add(consts.AuthHeaderName, rootToken)
 
 	lreq, status, err := buildLogicalRequest(core, nil, req)
@@ -339,7 +339,7 @@ func TestLogical_ListSuffix(t *testing.T) {
 	}
 
 	req, _ = http.NewRequest("GET", "http://127.0.0.1:8200/v1/secret/foo?list=true", nil)
-	req = req.WithContext(namespace.RootContext(nil))
+	req = req.WithContext(namespace.RootContext(t.Context()))
 	req.Header.Add(consts.AuthHeaderName, rootToken)
 
 	lreq, status, err = buildLogicalRequest(core, nil, req)
@@ -354,7 +354,7 @@ func TestLogical_ListSuffix(t *testing.T) {
 	}
 
 	req, _ = http.NewRequest("LIST", "http://127.0.0.1:8200/v1/secret/foo", nil)
-	req = req.WithContext(namespace.RootContext(nil))
+	req = req.WithContext(namespace.RootContext(t.Context()))
 	req.Header.Add(consts.AuthHeaderName, rootToken)
 
 	_, status, err = buildLogicalRequestNoAuth(nil, req)
@@ -430,7 +430,7 @@ func TestLogical_ListWithQueryParameters(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			req, _ := http.NewRequest(tc.requestMethod, tc.url, nil)
-			req = req.WithContext(namespace.RootContext(nil))
+			req = req.WithContext(namespace.RootContext(t.Context()))
 			req.Header.Add(consts.AuthHeaderName, rootToken)
 
 			lreq, status, err := buildLogicalRequest(core, nil, req)
@@ -456,7 +456,7 @@ func TestLogical_ListWithQueryParameters(t *testing.T) {
 func TestLogical_ScanSuffix(t *testing.T) {
 	core, _, rootToken := vault.TestCoreUnsealed(t)
 	req, _ := http.NewRequest("GET", "http://127.0.0.1:8200/v1/secret/foo", nil)
-	req = req.WithContext(namespace.RootContext(nil))
+	req = req.WithContext(namespace.RootContext(t.Context()))
 	req.Header.Add(consts.AuthHeaderName, rootToken)
 
 	lreq, status, err := buildLogicalRequest(core, nil, req)
@@ -471,7 +471,7 @@ func TestLogical_ScanSuffix(t *testing.T) {
 	}
 
 	req, _ = http.NewRequest("GET", "http://127.0.0.1:8200/v1/secret/foo?scan=true", nil)
-	req = req.WithContext(namespace.RootContext(nil))
+	req = req.WithContext(namespace.RootContext(t.Context()))
 	req.Header.Add(consts.AuthHeaderName, rootToken)
 
 	lreq, status, err = buildLogicalRequest(core, nil, req)
@@ -486,7 +486,7 @@ func TestLogical_ScanSuffix(t *testing.T) {
 	}
 
 	req, _ = http.NewRequest("SCAN", "http://127.0.0.1:8200/v1/secret/foo", nil)
-	req = req.WithContext(namespace.RootContext(nil))
+	req = req.WithContext(namespace.RootContext(t.Context()))
 	req.Header.Add(consts.AuthHeaderName, rootToken)
 
 	_, status, err = buildLogicalRequestNoAuth(nil, req)
@@ -562,7 +562,7 @@ func TestLogical_ScanWithQueryParameters(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			req, _ := http.NewRequest(tc.requestMethod, tc.url, nil)
-			req = req.WithContext(namespace.RootContext(nil))
+			req = req.WithContext(namespace.RootContext(t.Context()))
 			req.Header.Add(consts.AuthHeaderName, rootToken)
 
 			lreq, status, err := buildLogicalRequest(core, nil, req)
@@ -1110,7 +1110,7 @@ func TestLogical_NamespaceRestrictedAPIs(t *testing.T) {
 				"Restricted API should return 400 Bad Request with namespace")
 
 			if resp != nil && resp.Body != nil {
-				resp.Body.Close()
+				resp.Body.Close() //nolint:errcheck
 			}
 		})
 
@@ -1126,7 +1126,7 @@ func TestLogical_NamespaceRestrictedAPIs(t *testing.T) {
 			}
 
 			if resp != nil && resp.Body != nil {
-				resp.Body.Close()
+				resp.Body.Close() //nolint:errcheck
 			}
 		})
 	}
@@ -1142,7 +1142,7 @@ func TestLogical_NamespaceRestrictedAPIs(t *testing.T) {
 			require.Equal(t, http.StatusOK, resp.StatusCode,
 				"Non-restricted API should return 200 OK with namespace and proper permissions")
 
-			resp.Body.Close()
+			resp.Body.Close() //nolint:errcheck
 		})
 	}
 
@@ -1159,7 +1159,7 @@ func TestLogical_NamespaceRestrictedAPIs(t *testing.T) {
 				"Restricted API should return 400 Bad Request with namespace and proper permissions")
 
 			if resp != nil && resp.Body != nil {
-				resp.Body.Close()
+				resp.Body.Close() //nolint:errcheck
 			}
 		})
 	}

@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"math"
 	"net"
 	"net/http"
@@ -36,7 +37,9 @@ const (
 	EnvVaultCACertBytes      = "BAO_CACERT_BYTES"
 	EnvVaultCAPath           = "BAO_CAPATH"
 	EnvVaultClientCert       = "BAO_CLIENT_CERT"
+	EnvVaultClientCertBytes  = "BAO_CLIENT_CERT_BYTES"
 	EnvVaultClientKey        = "BAO_CLIENT_KEY"
+	EnvVaultClientKeyBytes   = "BAO_CLIENT_KEY_BYTES"
 	EnvVaultClientTimeout    = "BAO_CLIENT_TIMEOUT"
 	EnvVaultSRVLookup        = "BAO_SRV_LOOKUP"
 	EnvVaultSkipVerify       = "BAO_SKIP_VERIFY"
@@ -51,8 +54,12 @@ const (
 	EnvVaultProxyAddr        = "BAO_PROXY_ADDR"
 	EnvVaultDisableRedirects = "BAO_DISABLE_REDIRECTS"
 
+	// EnvTokenPath is the path to a file that holds a token. This is presently
+	// only respected by the `bao` CLI, not the API client.
+	EnvTokenPath = "BAO_TOKEN_PATH"
+
 	// NamespaceHeaderName is the header set to specify which namespace the
-	// request is indented for.
+	// request is intended for.
 	NamespaceHeaderName = "X-Vault-Namespace"
 
 	// AuthHeaderName is the name of the header containing the token.
@@ -61,6 +68,37 @@ const (
 	// RequestHeaderName is the name of the header used by the Agent for
 	// SSRF protection.
 	RequestHeaderName = "X-Vault-Request"
+
+	// NoRequestForwardingHeaderName is the name of the header telling Vault not
+	// to use request forwarding.
+	NoRequestForwardingHeaderName = "X-Vault-No-Request-Forwarding"
+
+	// MFAHeaderName represents the HTTP header which carries the credentials
+	// required to perform MFA on any path.
+	MFAHeaderName = "X-Vault-MFA"
+
+	// WrapTTLHeaderName is the name of the header containing a directive to
+	// wrap the response.
+	WrapTTLHeaderName = "X-Vault-Wrap-TTL"
+
+	// WrapFormatHeaderName is the name of the header containing the format to
+	// wrap in; has no effect if the wrap TTL is not set.
+	WrapFormatHeaderName = "X-Vault-Wrap-Format"
+
+	// RawErrorHeaderName is the name of the header that holds any errors that
+	// occurred responding to requests to special endpoints that return raw
+	// response bodies.
+	RawErrorHeaderName = "X-Vault-Raw-Error"
+
+	// HostnameHeaderName is the name of the header that holds the responding
+	// node's hostname when enable_response_header_hostname is set in the server
+	// configuration.
+	HostnameHeaderName = "X-Vault-Hostname"
+
+	// RaftNodeIDHeaderName is the name of the header that holds the responding
+	// node's Raft node ID if enable_response_header_raft_node_id is set in the
+	// server configuration and the node is participating in a Raft cluster.
+	RaftNodeIDHeaderName = "X-Vault-Raft-Node-ID"
 
 	// Path to perform inline authentication against. Any authentication
 	// performed must be single-request.
@@ -74,6 +112,12 @@ const (
 	// the value of X-Vault-Namespace; can be combined with any potential
 	// namespace in X-Vault-Inline-Auth-Path.
 	InlineAuthNamespaceHeaderName = "X-Vault-Inline-Auth-Namespace"
+
+	// Whether the response object is from the underlying auth method. This
+	// is sometimes not a sufficient check as a 404s and server errors are
+	// often returned without response bodies. But when a non-empty response
+	// is given, this disambiguates inline auth from subsequent call responses.
+	InlineAuthErrorResponseHeader = "X-Vault-Inline-Auth-Failed"
 
 	// Prefix of user-specified parameters sent to the endpoint specified
 	// in InlineAuthPathHeaderName. Each parameter is a base64 url-safe
@@ -206,7 +250,7 @@ type Config struct {
 	// CloneToken from parent.
 	CloneToken bool
 
-	// DisableRedirects when set to true, will prevent the client from
+	// DisableRedirects, when set to true, will prevent the client from
 	// automatically following a (single) redirect response to its initial
 	// request. This behavior may be desirable if using Vault CLI on the server
 	// side.
@@ -215,55 +259,74 @@ type Config struct {
 	// commands such as 'vault operator raft snapshot' as this redirects to the
 	// primary node.
 	DisableRedirects bool
-	clientTLSConfig  *tls.Config
+
+	// DisableEnvironment, when set to true, will skip automatic configuration
+	// based on well-known environment variables when the client is constructed.
+	DisableEnvironment bool
+
+	clientTLSConfig *tls.Config
 }
 
 // TLSConfig contains the parameters needed to configure TLS on the HTTP client
-// used to communicate with Vault.
+// used to communicate with OpenBao.
+//
+// The order of precedence for loading certificates & keys is equal to struct
+// field order, i.e., file paths, if set, take precedence over certificates &
+// keys passed in-memory. The exception is CAPath, which has lower precedence
+// than CACertBytes.
 type TLSConfig struct {
 	// CACert is the path to a PEM-encoded CA cert file to use to verify the
-	// Vault server SSL certificate. It takes precedence over CACertBytes
-	// and CAPath.
+	// OpenBao server's certificate.
 	CACert string
 
-	// CACertBytes is a PEM-encoded certificate or bundle. It takes precedence
-	// over CAPath.
-	CACertBytes []byte
-
-	// CAPath is the path to a directory of PEM-encoded CA cert files to verify
-	// the Vault server SSL certificate.
-	CAPath string
-
-	// ClientCert is the path to the certificate for Vault communication
+	// ClientCert is the path to the certificate for OpenBao communication.
 	ClientCert string
 
-	// ClientKey is the path to the private key for Vault communication
+	// ClientKey is the path to the private key for OpenBao communication.
 	ClientKey string
+
+	// CACertBytes is an in-memory PEM-encoded certificate or bundle to use to
+	// verify the OpenBao server's certificate.
+	CACertBytes []byte
+
+	// ClientCertBytes is an in-memory PEM-encoded certificate or bundle for
+	// OpenBao communication.
+	ClientCertBytes []byte
+
+	// ClientKeyBytes is an in-memory PEM-encoded key for OpenBao communication.
+	ClientKeyBytes []byte
+
+	// CAPath is the path to a directory of PEM-encoded CA cert files to verify
+	// the OpenBao server's certificate.
+	CAPath string
 
 	// TLSServerName, if set, is used to set the SNI host when connecting via
 	// TLS.
 	TLSServerName string
 
-	// Insecure enables or disables SSL verification
+	// Insecure enables or disables TLS certificate verification.
 	Insecure bool
 }
 
-// DefaultConfig returns a default configuration for the client. It is
-// safe to modify the return value of this function.
+// NewConfig returns a basic client configuration. It is safe to modify the
+// return value of this function.
 //
-// The default Address is https://127.0.0.1:8200, but this can be overridden by
-// setting the `BAO_ADDR` environment variable.
+// The returned config has no address set and must be adjusted before use, but
+// has the recommended HTTP client settings applied. To construct a config that
+// automatically populates its fields based on well-known environment variables,
+// see [DefaultConfig].
 //
-// If an error is encountered, the Error field on the returned *Config will be populated with the specific error.
-func DefaultConfig() *Config {
+// If an error is encountered, the Error field on the returned *[Config] will be
+// populated with the specific error.
+func NewConfig() *Config {
 	config := &Config{
-		Address:      "https://127.0.0.1:8200",
-		HttpClient:   cleanhttp.DefaultPooledClient(),
-		Timeout:      time.Second * 60,
-		MinRetryWait: time.Millisecond * 1000,
-		MaxRetryWait: time.Millisecond * 1500,
-		MaxRetries:   2,
-		Backoff:      retryablehttp.RateLimitLinearJitterBackoff,
+		HttpClient:         cleanhttp.DefaultPooledClient(),
+		Timeout:            time.Second * 60,
+		MinRetryWait:       time.Millisecond * 1000,
+		MaxRetryWait:       time.Millisecond * 1500,
+		MaxRetries:         2,
+		Backoff:            retryablehttp.RateLimitLinearJitterBackoff,
+		DisableEnvironment: true,
 	}
 
 	transport := config.HttpClient.Transport.(*http.Transport)
@@ -272,11 +335,6 @@ func DefaultConfig() *Config {
 		MinVersion: tls.VersionTLS12,
 	}
 	if err := http2.ConfigureTransport(transport); err != nil {
-		config.Error = err
-		return config
-	}
-
-	if err := config.ReadEnvironment(); err != nil {
 		config.Error = err
 		return config
 	}
@@ -296,20 +354,44 @@ func DefaultConfig() *Config {
 	return config
 }
 
+// DefaultConfig returns a default client configuration. It is safe to modify
+// the return value of this function.
+//
+// The default Address is https://127.0.0.1:8200, but this can be
+// overridden by setting the `BAO_ADDR` environment variable. Several other
+// fields are automatically populated from environment variables using
+// [Config.ReadEnvironment]. For a clean constructor that does not read
+// environment variables, see [NewConfig].
+//
+// If an error is encountered, the Error field on the returned *[Config] will be
+// populated with the specific error.
+func DefaultConfig() *Config {
+	config := NewConfig()
+	config.Address = "https://127.0.0.1:8200"
+	config.DisableEnvironment = false
+
+	if err := config.ReadEnvironment(); err != nil {
+		config.Error = err
+		return config
+	}
+
+	return config
+}
+
 // configureTLS is a lock free version of ConfigureTLS that can be used in
-// ReadEnvironment where the lock is already hold
+// ReadEnvironment where the lock is already held.
 func (c *Config) configureTLS(t *TLSConfig) error {
 	if c.HttpClient == nil {
-		c.HttpClient = DefaultConfig().HttpClient
+		c.HttpClient = NewConfig().HttpClient
 	}
 	clientTLSConfig := c.HttpClient.Transport.(*http.Transport).TLSClientConfig
 
 	var clientCert tls.Certificate
+	var err error
 	foundClientCert := false
 
 	switch {
 	case t.ClientCert != "" && t.ClientKey != "":
-		var err error
 		clientCert, err = tls.LoadX509KeyPair(t.ClientCert, t.ClientKey)
 		if err != nil {
 			return err
@@ -317,12 +399,23 @@ func (c *Config) configureTLS(t *TLSConfig) error {
 		foundClientCert = true
 		c.curlClientCert = t.ClientCert
 		c.curlClientKey = t.ClientKey
-	case t.ClientCert != "" || t.ClientKey != "":
+	case len(t.ClientCertBytes) != 0 && len(t.ClientKeyBytes) != 0:
+		clientCert, err = tls.X509KeyPair(t.ClientCertBytes, t.ClientKeyBytes)
+		if err != nil {
+			return err
+		}
+		foundClientCert = true
+		c.curlClientCert = "passed-in-memory"
+		c.curlClientKey = "passed-in-memory"
+	case t.ClientCert != "" || t.ClientKey != "", len(t.ClientCertBytes) != 0 || len(t.ClientKeyBytes) != 0:
 		return errors.New("both client cert and client key must be provided")
 	}
 
 	if t.CACert != "" || len(t.CACertBytes) != 0 || t.CAPath != "" {
 		c.curlCACert = t.CACert
+		if t.CACert == "" {
+			c.curlCACert = "passed-in-memory"
+		}
 		c.curlCAPath = t.CAPath
 		rootConfig := &certConfig{
 			CAFile:        t.CACert,
@@ -370,16 +463,33 @@ func (c *Config) ConfigureTLS(t *TLSConfig) error {
 	return c.configureTLS(t)
 }
 
+// ConfigureTLS invokes config.ConfigureTLS. This exposes the ability to reload
+// TLS configuration without recreating the client, which is useful for rotating
+// short-lived TLS credentials.
+func (c *Client) ConfigureTLS(t *TLSConfig) error {
+	c.modifyLock.RLock()
+	defer c.modifyLock.RUnlock()
+
+	return c.config.ConfigureTLS(t)
+}
+
 // ReadEnvironment reads configuration information from the environment. If
-// there is an error, no configuration value is updated.
+// there is an error, no configuration value is updated. This is a no-op if
+// DisableEnvironment is set.
 func (c *Config) ReadEnvironment() error {
+	if c.DisableEnvironment {
+		return nil
+	}
+
 	var envAddress string
 	var envAgentAddress string
 	var envCACert string
 	var envCACertBytes []byte
 	var envCAPath string
 	var envClientCert string
+	var envClientCertBytes []byte
 	var envClientKey string
+	var envClientKeyBytes []byte
 	var envClientTimeout time.Duration
 	var envInsecure bool
 	var envTLSServerName string
@@ -416,8 +526,14 @@ func (c *Config) ReadEnvironment() error {
 	if v := ReadBaoVariable(EnvVaultClientCert); v != "" {
 		envClientCert = v
 	}
+	if v := ReadBaoVariable(EnvVaultClientCertBytes); v != "" {
+		envClientCertBytes = []byte(v)
+	}
 	if v := ReadBaoVariable(EnvVaultClientKey); v != "" {
 		envClientKey = v
+	}
+	if v := ReadBaoVariable(EnvVaultClientKeyBytes); v != "" {
+		envClientKeyBytes = []byte(v)
 	}
 	if v := ReadBaoVariable(EnvRateLimit); v != "" {
 		rateLimit, burstLimit, err := parseRateLimit(v)
@@ -473,13 +589,15 @@ func (c *Config) ReadEnvironment() error {
 
 	// Configure the HTTP clients TLS configuration.
 	t := &TLSConfig{
-		CACert:        envCACert,
-		CACertBytes:   envCACertBytes,
-		CAPath:        envCAPath,
-		ClientCert:    envClientCert,
-		ClientKey:     envClientKey,
-		TLSServerName: envTLSServerName,
-		Insecure:      envInsecure,
+		CACert:          envCACert,
+		CACertBytes:     envCACertBytes,
+		CAPath:          envCAPath,
+		ClientCert:      envClientCert,
+		ClientCertBytes: envClientCertBytes,
+		ClientKey:       envClientKey,
+		ClientKeyBytes:  envClientKeyBytes,
+		TLSServerName:   envTLSServerName,
+		Insecure:        envInsecure,
 	}
 
 	c.modifyLock.Lock()
@@ -533,11 +651,9 @@ func (c *Config) ParseAddress(address string) (*url.URL, error) {
 
 	c.Address = address
 
-	if strings.HasPrefix(address, "unix://") {
+	if socket, ok := strings.CutPrefix(address, "unix://"); ok {
 		// When the address begins with unix://, always change the transport's
 		// DialContext (to match previous behaviour)
-		socket := strings.TrimPrefix(address, "unix://")
-
 		if transport, ok := c.HttpClient.Transport.(*http.Transport); ok {
 			transport.DialContext = func(context.Context, string, string) (net.Conn, error) {
 				return net.Dial("unix", socket)
@@ -595,14 +711,23 @@ type Client struct {
 
 // NewClient returns a new client for the given configuration.
 //
-// If the configuration is nil, Vault will use configuration from
-// DefaultConfig(), which is the recommended starting configuration.
+// If the configuration is nil, OpenBao will use configuration from
+// [DefaultConfig], which is the recommended starting configuration.
 //
-// If the environment variable `BAO_TOKEN` is present, the token will be
-// automatically added to the client. Otherwise, you must manually call
-// `SetToken()`.
+// If the environment variables `BAO_TOKEN` and/or `BAO_NAMESPACE` are present
+// and DisableEnvironment is not set, token and namespace will be automatically
+// added to the client. Otherwise, you must manually call [Client.SetToken] and
+// [Client.SetNamespace].
 func NewClient(c *Config) (*Client, error) {
-	def := DefaultConfig()
+	var def *Config
+	if c != nil && c.DisableEnvironment {
+		// If we have a partial config that tells us not to read environment
+		// variables, call NewConfig rather than DefaultConfig.
+		def = NewConfig()
+	} else {
+		def = DefaultConfig()
+	}
+
 	if def == nil {
 		return nil, errors.New("could not create/read default configuration")
 	}
@@ -651,12 +776,13 @@ func NewClient(c *Config) (*Client, error) {
 	// Add the VaultRequest SSRF protection header
 	client.headers[RequestHeaderName] = []string{"true"}
 
-	if token := ReadBaoVariable(EnvVaultToken); token != "" {
-		client.token = token
-	}
-
-	if namespace := ReadBaoVariable(EnvVaultNamespace); namespace != "" {
-		client.setNamespace(namespace)
+	if !c.DisableEnvironment {
+		if token := ReadBaoVariable(EnvVaultToken); token != "" {
+			client.token = token
+		}
+		if namespace := ReadBaoVariable(EnvVaultNamespace); namespace != "" {
+			client.setNamespace(namespace)
+		}
 	}
 
 	return client, nil
@@ -666,7 +792,7 @@ func (c *Client) CloneConfig() *Config {
 	c.modifyLock.RLock()
 	defer c.modifyLock.RUnlock()
 
-	newConfig := DefaultConfig()
+	newConfig := NewConfig()
 	newConfig.Address = c.config.Address
 	newConfig.AgentAddress = c.config.AgentAddress
 	newConfig.MinRetryWait = c.config.MinRetryWait
@@ -1481,12 +1607,12 @@ func (c *Client) httpRequestWithContext(ctx context.Context, r *Request) (*Respo
 	}
 
 	if len(r.WrapTTL) != 0 {
-		req.Header.Set("X-Vault-Wrap-TTL", r.WrapTTL)
+		req.Header.Set(WrapTTLHeaderName, r.WrapTTL)
 	}
 
 	if len(r.MFAHeaderVals) != 0 {
 		for _, mfaHeaderVal := range r.MFAHeaderVals {
-			req.Header.Add("X-Vault-MFA", mfaHeaderVal)
+			req.Header.Add(MFAHeaderName, mfaHeaderVal)
 		}
 	}
 
@@ -1540,7 +1666,7 @@ func (c *Client) httpRequestWithContext(ctx context.Context, r *Request) (*Respo
 		}
 
 		// Retry the request
-		resp, err = httpClient.Do(req)
+		_, err = httpClient.Do(req)
 		if err != nil {
 			return result, fmt.Errorf("redirect failed: %s", err)
 		}
@@ -1628,10 +1754,7 @@ func (c *Client) WithInlineAuth(path string, data map[string]interface{}, opts .
 	headers[InlineAuthPathHeaderName] = []string{path}
 
 	for _, opt := range opts {
-		oHeader := opt()
-		for name, value := range oHeader {
-			headers[name] = value
-		}
+		maps.Copy(headers, opt())
 	}
 
 	for key, value := range data {

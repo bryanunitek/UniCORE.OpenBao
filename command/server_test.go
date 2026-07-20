@@ -8,6 +8,7 @@ import (
 	"crypto/x509"
 	"fmt"
 	"os"
+	"path"
 	"strings"
 	"sync"
 	"testing"
@@ -110,25 +111,21 @@ func TestServer_ReloadListener(t *testing.T) {
 	t.Parallel()
 
 	wd, _ := os.Getwd()
-	wd += "/server/test-fixtures/reload/"
+	wd = path.Join(wd, "server", "test-fixtures", "reload")
 
-	td, err := os.MkdirTemp("", "vault-test-")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer os.RemoveAll(td)
+	td := t.TempDir()
 
 	wg := &sync.WaitGroup{}
 	// Setup initial certs
-	inBytes, _ := os.ReadFile(wd + "reload_foo.pem")
-	os.WriteFile(td+"/reload_cert.pem", inBytes, 0o777)
-	inBytes, _ = os.ReadFile(wd + "reload_foo.key")
-	os.WriteFile(td+"/reload_key.pem", inBytes, 0o777)
+	inBytes, _ := os.ReadFile(path.Join(wd, "reload_foo.pem"))
+	_ = os.WriteFile(path.Join(td, "reload_cert.pem"), inBytes, 0o777)
+	inBytes, _ = os.ReadFile(path.Join(wd, "reload_foo.key"))
+	_ = os.WriteFile(path.Join(td, "reload_key.pem"), inBytes, 0o777)
 
 	relhcl := strings.ReplaceAll(reloadHCL, "TMPDIR", td)
-	os.WriteFile(td+"/reload.hcl", []byte(relhcl), 0o777)
+	_ = os.WriteFile(path.Join(td, "reload.hcl"), []byte(relhcl), 0o777)
 
-	inBytes, _ = os.ReadFile(wd + "reload_ca.pem")
+	inBytes, _ = os.ReadFile(path.Join(wd, "reload_ca.pem"))
 	certPool := x509.NewCertPool()
 	ok := certPool.AppendCertsFromPEM(inBytes)
 	if !ok {
@@ -139,7 +136,7 @@ func TestServer_ReloadListener(t *testing.T) {
 	_ = ui
 
 	wg.Add(1)
-	args := []string{"-config", td + "/reload.hcl"}
+	args := []string{"-config", path.Join(td, "reload.hcl")}
 	go func() {
 		if code := cmd.Run(args); code != 0 {
 			output := ui.ErrorWriter.String() + ui.OutputWriter.String()
@@ -177,11 +174,11 @@ func TestServer_ReloadListener(t *testing.T) {
 	}
 
 	relhcl = strings.ReplaceAll(reloadHCL, "TMPDIR", td)
-	inBytes, _ = os.ReadFile(wd + "reload_bar.pem")
-	os.WriteFile(td+"/reload_cert.pem", inBytes, 0o777)
-	inBytes, _ = os.ReadFile(wd + "reload_bar.key")
-	os.WriteFile(td+"/reload_key.pem", inBytes, 0o777)
-	os.WriteFile(td+"/reload.hcl", []byte(relhcl), 0o777)
+	inBytes, _ = os.ReadFile(path.Join(wd, "reload_bar.pem"))
+	_ = os.WriteFile(path.Join(td, "reload_cert.pem"), inBytes, 0o777)
+	inBytes, _ = os.ReadFile(path.Join(wd, "reload_bar.key"))
+	_ = os.WriteFile(path.Join(td, "reload_key.pem"), inBytes, 0o777)
+	_ = os.WriteFile(path.Join(td, "reload.hcl"), []byte(relhcl), 0o777)
 
 	cmd.SighupCh <- struct{}{}
 	select {
@@ -200,8 +197,6 @@ func TestServer_ReloadListener(t *testing.T) {
 }
 
 func TestServer(t *testing.T) {
-	t.Parallel()
-
 	cases := []struct {
 		name     string
 		contents string
@@ -289,11 +284,7 @@ func TestServer(t *testing.T) {
 	}
 
 	for _, tc := range cases {
-		tc := tc
-
 		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-
 			ui, cmd := testServerCommand(t)
 
 			f, err := os.CreateTemp(t.TempDir(), "")

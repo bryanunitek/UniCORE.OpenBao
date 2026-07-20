@@ -16,7 +16,6 @@ import (
 type RotateInitRequest struct {
 	SecretShares        int      `json:"secret_shares"`
 	SecretThreshold     int      `json:"secret_threshold"`
-	StoredShares        int      `json:"stored_shares"`
 	PGPKeys             []string `json:"pgp_keys"`
 	Backup              bool     `json:"backup"`
 	RequireVerification bool     `json:"require_verification"`
@@ -87,7 +86,7 @@ func (c *Sys) RotateRootStatusWithContext(ctx context.Context) (*RotateStatusRes
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
+	defer resp.Body.Close() //nolint:errcheck
 
 	var result struct {
 		Data *RotateStatusResponse
@@ -109,7 +108,7 @@ func (c *Sys) RotateRecoveryStatusWithContext(ctx context.Context) (*RotateStatu
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
+	defer resp.Body.Close() //nolint:errcheck
 
 	var result struct {
 		Data *RotateStatusResponse
@@ -135,7 +134,7 @@ func (c *Sys) RotateRootInitWithContext(ctx context.Context, config *RotateInitR
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
+	defer resp.Body.Close() //nolint:errcheck
 
 	var result struct {
 		Data *RotateStatusResponse
@@ -161,7 +160,7 @@ func (c *Sys) RotateRecoveryInitWithContext(ctx context.Context, config *RotateI
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
+	defer resp.Body.Close() //nolint:errcheck
 
 	var result struct {
 		Data *RotateStatusResponse
@@ -183,7 +182,7 @@ func (c *Sys) RotateRootCancelWithContext(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	return resp.Body.Close()
+	return resp.Body.Close() //nolint:errcheck
 }
 
 func (c *Sys) RotateRecoveryCancel() error {
@@ -199,7 +198,7 @@ func (c *Sys) RotateRecoveryCancelWithContext(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	return resp.Body.Close()
+	return resp.Body.Close() //nolint:errcheck
 }
 
 func (c *Sys) RotateRootUpdate(shard, nonce string) (*RotateUpdateResponse, error) {
@@ -224,7 +223,7 @@ func (c *Sys) RotateRootUpdateWithContext(ctx context.Context, shard, nonce stri
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
+	defer resp.Body.Close() //nolint:errcheck
 
 	var result struct {
 		Data *RotateUpdateResponse
@@ -255,7 +254,7 @@ func (c *Sys) RotateRecoveryUpdateWithContext(ctx context.Context, shard, nonce 
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
+	defer resp.Body.Close() //nolint:errcheck
 
 	var result struct {
 		Data *RotateUpdateResponse
@@ -277,7 +276,7 @@ func (c *Sys) RotateRootRetrieveBackupWithContext(ctx context.Context) (*RotateR
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
+	defer resp.Body.Close() //nolint:errcheck
 
 	secret, err := ParseSecret(resp.Body)
 	if err != nil {
@@ -309,7 +308,7 @@ func (c *Sys) RotateRecoveryRetrieveBackupWithContext(ctx context.Context) (*Rot
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
+	defer resp.Body.Close() //nolint:errcheck
 
 	secret, err := ParseSecret(resp.Body)
 	if err != nil {
@@ -342,7 +341,7 @@ func (c *Sys) RotateRootDeleteBackupWithContext(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	return resp.Body.Close()
+	return resp.Body.Close() //nolint:errcheck
 }
 
 func (c *Sys) RotateRecoveryDeleteBackup() error {
@@ -359,7 +358,7 @@ func (c *Sys) RotateRecoveryDeleteBackupWithContext(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	return resp.Body.Close()
+	return resp.Body.Close() //nolint:errcheck
 }
 
 func (c *Sys) RotateRootVerificationStatus() (*RotateVerificationStatusResponse, error) {
@@ -375,7 +374,7 @@ func (c *Sys) RotateRootVerificationStatusWithContext(ctx context.Context) (*Rot
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
+	defer resp.Body.Close() //nolint:errcheck
 
 	var result struct {
 		Data *RotateVerificationStatusResponse
@@ -397,7 +396,7 @@ func (c *Sys) RotateRecoveryVerificationStatusWithContext(ctx context.Context) (
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
+	defer resp.Body.Close() //nolint:errcheck
 
 	var result struct {
 		Data *RotateVerificationStatusResponse
@@ -428,7 +427,7 @@ func (c *Sys) RotateRootVerificationUpdateWithContext(ctx context.Context, shard
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
+	defer resp.Body.Close() //nolint:errcheck
 
 	var result struct {
 		Data *RotateVerificationUpdateResponse
@@ -459,7 +458,7 @@ func (c *Sys) RotateRecoveryVerificationUpdateWithContext(ctx context.Context, s
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
+	defer resp.Body.Close() //nolint:errcheck
 
 	var result struct {
 		Data *RotateVerificationUpdateResponse
@@ -482,7 +481,7 @@ func (c *Sys) RotateRootVerificationCancelWithContext(ctx context.Context) error
 	if err != nil {
 		return err
 	}
-	return resp.Body.Close()
+	return resp.Body.Close() //nolint:errcheck
 }
 
 func (c *Sys) RotateRecoveryVerificationCancel() error {
@@ -499,7 +498,7 @@ func (c *Sys) RotateRecoveryVerificationCancelWithContext(ctx context.Context) e
 	if err != nil {
 		return err
 	}
-	return resp.Body.Close()
+	return resp.Body.Close() //nolint:errcheck
 }
 
 // Deprecated: use RotateKeyring instead.
@@ -519,7 +518,7 @@ func (c *Sys) RotateWithContext(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	return resp.Body.Close()
+	return resp.Body.Close() //nolint:errcheck
 }
 
 func (c *Sys) RotateKeyring() error {
@@ -536,7 +535,7 @@ func (c *Sys) RotateKeyringWithContext(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	return resp.Body.Close()
+	return resp.Body.Close() //nolint:errcheck
 }
 
 func (c *Sys) RotateRoot() error {
@@ -553,7 +552,7 @@ func (c *Sys) RotateRootWithContext(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	return resp.Body.Close()
+	return resp.Body.Close() //nolint:errcheck
 }
 
 func (c *Sys) KeyStatus() (*KeyStatus, error) {
@@ -570,7 +569,7 @@ func (c *Sys) KeyStatusWithContext(ctx context.Context) (*KeyStatus, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
+	defer resp.Body.Close() //nolint:errcheck
 
 	secret, err := ParseSecret(resp.Body)
 	if err != nil {

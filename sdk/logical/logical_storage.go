@@ -130,7 +130,7 @@ func StartTxStorage(ctx context.Context, req *Request) (func(), error) {
 		}
 		req.OriginalStorage = req.Storage
 		req.Storage = txn
-		return func() { txn.Rollback(ctx) }, nil
+		return func() { txn.Rollback(ctx) }, nil //nolint:errcheck
 	}
 	return func() {}, nil
 }
