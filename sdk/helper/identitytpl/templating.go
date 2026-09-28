@@ -20,7 +20,8 @@ var (
 	ErrNoEntityAttachedToToken       = errors.New("string contains entity template directives but no entity was provided")
 	ErrNoGroupsAttachedToToken       = errors.New("string contains groups template directives but no groups were provided")
 	ErrTemplateValueNotFound         = errors.New("no value could be found for one of the template directives")
-	ErrTemplateWildcard              = `template substitution contains forbidden value %q`
+
+	ErrTemplateWildcard = errors.New(`template substitution contains forbidden value`)
 )
 
 const (
@@ -48,11 +49,11 @@ type PopulateStringInput struct {
 // are emitted verbatim, but they're wrapped in double quotes for JSON mode. And
 // some structures, like slices, might be rendered in one mode but prohibited in
 // another.
-type templateHandlerFunc func(interface{}, ...string) (string, error)
+type templateHandlerFunc func(any, ...string) (string, error)
 
 // aclTemplateHandler processes known parameter data types when operating
 // in ACL mode.
-func aclTemplateHandler(v interface{}, keys ...string) (string, error) {
+func aclTemplateHandler(v any, keys ...string) (string, error) {
 	switch t := v.(type) {
 	case string:
 		if t == "" {
@@ -76,8 +77,8 @@ func aclTemplateHandler(v interface{}, keys ...string) (string, error) {
 
 // jsonTemplateHandler processes known parameter data types when operating
 // in JSON mode.
-func jsonTemplateHandler(v interface{}, keys ...string) (string, error) {
-	jsonMarshaller := func(v interface{}) (string, error) {
+func jsonTemplateHandler(v any, keys ...string) (string, error) {
+	jsonMarshaller := func(v any) (string, error) {
 		enc, err := json.Marshal(v)
 		if err != nil {
 			return "", err
@@ -121,7 +122,7 @@ func PopulateString(p PopulateStringInput) (bool, string, error) {
 	case JSONTemplating:
 		p.templateHandler = jsonTemplateHandler
 	default:
-		return false, "", fmt.Errorf("unknown mode %q", p.Mode)
+		return false, "", fmt.Errorf("unknown mode %v", p.Mode)
 	}
 
 	var subst bool
@@ -159,7 +160,7 @@ func PopulateString(p PopulateStringInput) (bool, string, error) {
 				}
 				for _, blocked := range p.BlockedSubstitutions {
 					if strings.Contains(tmplStr, blocked) {
-						return false, "", fmt.Errorf(ErrTemplateWildcard, blocked)
+						return false, "", fmt.Errorf("%w: %q", ErrTemplateWildcard, blocked)
 					}
 				}
 				b.WriteString(tmplStr)
